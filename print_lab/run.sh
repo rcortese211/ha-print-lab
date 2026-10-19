@@ -29,7 +29,7 @@ if ! mountpoint -q "$DRIVE"; then
     FSTYPE=$(blkid -p -o value -s TYPE "$DEV" 2>/dev/null || true)
     FSTYPE=${FSTYPE:-exfat}
     log "Mounting $DEV ($FSTYPE) at $DRIVE"
-    if ! mount -t "$FSTYPE" -o noatime "$DEV" "$DRIVE"; then
+    if ! mount -i -t "$FSTYPE" -o noatime "$DEV" "$DRIVE"; then
         log "Kernel mount failed; trying the FUSE driver"
         if [ "$FSTYPE" = "exfat" ] && mount.exfat-fuse -o noatime "$DEV" "$DRIVE"; then
             log "Mounted with FUSE"
