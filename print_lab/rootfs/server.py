@@ -119,6 +119,10 @@ def slice_job(req):
         out.write_bytes(data)
     if b"G9111 " not in data[:20000]:
         raise JobError("Sliced file is missing the Kobra start block (G9111) - wrong profile?")
+    applied = []
+    if req.get("temps"):
+        data, applied = apply_temps(data, req["temps"])
+        out.write_bytes(data)
     tail = data[-6000:].decode(errors="ignore")
 
     def grab(label):
@@ -128,7 +132,38 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"), "profile": profile,
-            "layers": data.count(b";LAYER_CHANGE")}
+            "layers": data.count(b";LAYER_CHANGE"), "temps_applied": applied}
+
+
+def apply_temps(data, temps):
+    """Temperature tower: set the nozzle temperature at given heights.
+
+    temps is [[from_z_mm, celsius], ...]. An M104 goes in right after the first
+    layer marker at or above each height, so the change lands before that layer
+    prints.
+    """
+    try:
+        steps = sorted((float(z), int(t)) for z, t in temps)
+    except (TypeError, ValueError) as err:
+        raise JobError("temps must be a list of [height_mm, temperature]") from err
+    if len(steps) > 40 or any(not 170 <= t <= 280 or z < 0 for z, t in steps):
+        raise JobError("temps: up to 40 steps, 170-280 C, heights 0 or more")
+    lines, applied, i = data.split(b"\n"), [], 0
+    out = []
+    for line in lines:
+        out.append(line)
+        if i < len(steps) and line.startswith(b";Z:"):
+            z = float(line[3:].strip())
+            temp = None
+            while i < len(steps) and z + 1e-6 >= steps[i][0]:
+                temp = steps[i][1]
+                i += 1
+            if temp is not None:
+                out.append(b"M104 S%d ; temp tower" % temp)
+                applied.append([round(z, 2), temp])
+    if i < len(steps):
+        raise JobError(f"temps: the print never reaches {steps[i][0]} mm")
+    return b"\n".join(out), applied
 
 
 class Handler(BaseHTTPRequestHandler):

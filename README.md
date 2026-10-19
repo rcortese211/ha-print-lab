@@ -28,3 +28,7 @@ run on the CPU with onnxruntime. The model is downloaded once, checksum-verified
 to `printlab/ai/` on the drive. Frames scoring above 0.3 are kept in
 `printlab/watch/history/` for tuning. Smoothing and the pause decision live in the
 Home Assistant `kobra_print` integration.
+
+### Temperature towers
+
+`POST /slice` also takes `temps`: a list of `[height_mm, nozzle_c]` steps. After slicing, an `M104` is inserted at the first layer at or above each height, so each tier of a temperature tower prints at its own temperature. The response lists the steps it applied in `temps_applied`.
