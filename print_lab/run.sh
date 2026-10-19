@@ -78,12 +78,27 @@ if [ ! -f "$ROOT/.printlab-ready" ]; then
     log "Toolchain installed."
 fi
 
+# failure detection: ffmpeg for frames, onnxruntime for the model (one time)
+if [ ! -f "$ROOT/.printlab-ai-ready" ]; then
+    log "Installing the print-failure detector (ffmpeg + onnxruntime) into the image..."
+    chroot "$ROOT" /bin/sh -c "
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y --no-install-recommends ffmpeg python3-numpy python3-venv python3-pip
+        apt-get clean
+        python3 -m venv --system-site-packages /opt/ai
+        /opt/ai/bin/pip install --no-cache-dir onnxruntime
+    "
+    touch "$ROOT/.printlab-ai-ready"
+    log "Detector installed."
+fi
+
 # ship code and default profiles (never overwrite a profile already on the drive)
 mkdir -p "$ROOT/srv"
-cp /opt/printlab-files/server.py "$ROOT/srv/server.py"
+cp /opt/printlab-files/server.py /opt/printlab-files/watch.py "$ROOT/srv/"
 for p in /opt/printlab-files/profiles/*.ini; do
     [ -f "$LAB/profiles/$(basename "$p")" ] || cp "$p" "$LAB/profiles/"
 done
 
 log "Starting slice server on :8099"
-exec chroot "$ROOT" /usr/bin/python3 -u /srv/server.py
+exec chroot "$ROOT" /opt/ai/bin/python3 -u /srv/server.py

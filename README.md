@@ -18,3 +18,13 @@ lifting on an external USB drive.
 * `POST /slice` - JSON `{name, scad | url | model, profile, overrides}`; returns the G-code name and stats
 * `GET /gcode/<name>` - the sliced file
 * `GET /profiles`, `PUT /profiles/<name>` - list / replace slicer profiles
+
+## Print failure watch
+
+`POST /detect` grabs one frame from the printer camera (or takes a JPEG body) and
+scores it with Obico's open-source failure-detection model
+([obico-server](https://github.com/TheSpaghettiDetective/obico-server), AGPL-3.0),
+run on the CPU with onnxruntime. The model is downloaded once, checksum-verified,
+to `printlab/ai/` on the drive. Frames scoring above 0.3 are kept in
+`printlab/watch/history/` for tuning. Smoothing and the pause decision live in the
+Home Assistant `kobra_print` integration.

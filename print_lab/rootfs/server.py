@@ -6,6 +6,8 @@ Internal Supervisor network only. Endpoints:
   GET  /gcode/<name>
   GET  /profiles
   PUT  /profiles/<name>  (body: ini text)
+  POST /detect           {stream_url} or a JPEG body; returns the failure score
+  GET  /watch/last.jpg   the frame the last check looked at
 """
 import hashlib
 import json
@@ -19,6 +21,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from watch import Detector, WatchError
+
 LAB = Path(os.environ.get("PRINTLAB_DIR", "/lab"))
 MODELS, GCODE, PROFILES, WORK = (LAB / d for d in ("models", "gcode", "profiles", "work"))
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,60}")
@@ -27,6 +31,8 @@ VAL_RE = re.compile(r"[A-Za-z0-9_.,%+ -]{0,60}")
 MODEL_EXT = (".stl", ".3mf", ".obj", ".step", ".stp", ".scad")
 MAX_DOWNLOAD = 200 * 1024 * 1024
 LOCK = threading.Lock()
+DET_LOCK = threading.Lock()
+DETECTOR = Detector(LAB)
 
 
 class JobError(Exception):
@@ -149,15 +155,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "prusaslicer": version(["prusa-slicer", "--help"]),
                                     "openscad": version(["openscad", "--version"]),
                                     "drive_free_gb": round(free.free / 1e9, 1),
+                                    "detector": DETECTOR.status,
                                     "profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
         if path == "/profiles":
             return self._send(200, {"profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
+        if path == "/watch/last.jpg" and (DETECTOR.dir / "last.jpg").is_file():
+            return self._send(200, raw=(DETECTOR.dir / "last.jpg").read_bytes(), ctype="image/jpeg")
         m = re.fullmatch(r"/gcode/([A-Za-z0-9_-]{1,60}\.gcode)", path)
         if m and (GCODE / m.group(1)).is_file():
             return self._send(200, raw=(GCODE / m.group(1)).read_bytes(), ctype="text/plain")
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path == "/detect":
+            return self._detect()
         if urllib.parse.urlsplit(self.path).path != "/slice":
             return self._send(404, {"error": "not found"})
         try:
@@ -170,6 +181,23 @@ class Handler(BaseHTTPRequestHandler):
                 LOCK.release()
         except (JobError, ValueError, subprocess.TimeoutExpired) as err:
             self._send(400, {"error": str(err)})
+
+    def _detect(self):
+        try:
+            if not DET_LOCK.acquire(timeout=60):
+                raise WatchError("Another check is still running")
+            try:
+                if (self.headers.get("Content-Type") or "").startswith("image/jpeg"):
+                    result = DETECTOR.check(jpeg=self._body(8 * 1024 * 1024))
+                else:
+                    result = DETECTOR.check(url=str(json.loads(self._body()).get("stream_url", "")))
+            finally:
+                DET_LOCK.release()
+            self._send(200, result)
+        except (WatchError, JobError, ValueError, subprocess.TimeoutExpired) as err:
+            self._send(400, {"error": str(err)})
+        except Exception as err:  # noqa: BLE001  model/runtime trouble: report, don't die
+            self._send(500, {"error": f"{type(err).__name__}: {err}"})
 
     def do_PUT(self):
         m = re.fullmatch(r"/profiles/([A-Za-z0-9_-]{1,60})", urllib.parse.urlsplit(self.path).path)
@@ -191,4 +219,12 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     for d in (MODELS, GCODE, PROFILES, WORK):
         d.mkdir(parents=True, exist_ok=True)
+    def _warm():
+        try:
+            DETECTOR.ensure_model()
+        except Exception as err:  # noqa: BLE001
+            DETECTOR.status = f"error: {err}"
+            print(f"[print_lab] detector not ready: {err}", flush=True)
+
+    threading.Thread(target=_warm, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
