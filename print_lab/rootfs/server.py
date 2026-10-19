@@ -119,9 +119,18 @@ def slice_job(req):
         out.write_bytes(data)
     if b"G9111 " not in data[:20000]:
         raise JobError("Sliced file is missing the Kobra start block (G9111) - wrong profile?")
-    applied = []
-    if req.get("temps"):
-        data, applied = apply_temps(data, req["temps"])
+    # "tune" carries calibration steps; top-level "temps" is kept for older callers
+    tune = dict(req.get("tune") or {})
+    if req.get("temps") and "temps" not in tune:
+        tune["temps"] = req["temps"]
+    applied, retracts_applied = [], []
+    if tune.get("temps"):
+        data, applied = apply_temps(data, tune["temps"])
+    if tune.get("retracts"):
+        base = float((req.get("overrides") or {}).get("retract_length")
+                     or profile_value(profile, "retract_length") or 0)
+        data, retracts_applied = apply_retracts(data, tune["retracts"], base)
+    if applied or retracts_applied:
         out.write_bytes(data)
     tail = data[-6000:].decode(errors="ignore")
 
@@ -132,7 +141,57 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"), "profile": profile,
-            "layers": data.count(b";LAYER_CHANGE"), "temps_applied": applied}
+            "layers": data.count(b";LAYER_CHANGE"), "temps_applied": applied,
+            "retracts_applied": retracts_applied}
+
+
+def profile_value(profile, key):
+    for line in (PROFILES / f"{profile}.ini").read_text().splitlines():
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip()
+    return None
+
+
+E_RE = re.compile(rb"^(G1(?: [^E;]\S*)*) E(-?[0-9.]+)(.*)$")
+
+
+def apply_retracts(data, steps, base):
+    """Retraction tower: change the retraction length at given heights.
+
+    steps is [[from_z_mm, length_mm], ...]. Needs relative E. Every retraction
+    move (negative E, including the part done during a wipe) and every plain
+    un-retract (E only, no X/Y) is scaled by length / base from that height up.
+    """
+    if base <= 0:
+        raise JobError("retracts: the profile has no retraction to scale")
+    try:
+        steps = sorted((float(z), float(l)) for z, l in steps)
+    except (TypeError, ValueError) as err:
+        raise JobError("retracts must be a list of [height_mm, length_mm]") from err
+    if len(steps) > 40 or any(not 0 <= l <= 4 or z < 0 for z, l in steps):
+        raise JobError("retracts: up to 40 steps, 0-4 mm, heights 0 or more")
+    if b"M83" not in data[:20000] and b"relative extrusion" not in data[:20000]:
+        raise JobError("retracts: the G-code does not use relative extrusion")
+    out, applied, i, k = [], [], 0, None
+    for line in data.split(b"\n"):
+        if i < len(steps) and line.startswith(b";Z:"):
+            z = float(line[3:].strip())
+            while i < len(steps) and z + 1e-6 >= steps[i][0]:
+                k = steps[i][1] / base
+                applied.append([round(z, 2), steps[i][1]])
+                i += 1
+        if k is not None and line.startswith(b"G1 "):
+            m = E_RE.match(line)
+            if m:
+                e = float(m.group(2))
+                xy = b" X" in m.group(1) or b" Y" in m.group(1)
+                if e < 0 or not xy:
+                    line = m.group(1) + b" E%.5f" % (e * k) + m.group(3)
+        out.append(line)
+    if i < len(steps):
+        raise JobError(f"retracts: the print never reaches {steps[i][0]} mm")
+    return b"\n".join(out), applied
 
 
 def apply_temps(data, temps):

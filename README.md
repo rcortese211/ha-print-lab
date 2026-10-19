@@ -32,3 +32,16 @@ Home Assistant `kobra_print` integration.
 ### Temperature towers
 
 `POST /slice` also takes `temps`: a list of `[height_mm, nozzle_c]` steps. After slicing, an `M104` is inserted at the first layer at or above each height, so each tier of a temperature tower prints at its own temperature. The response lists the steps it applied in `temps_applied`.
+
+### Calibration steps (`tune`)
+
+`POST /slice` takes `tune`, a set of height-based changes applied after slicing:
+
+- `temps`: `[[height_mm, nozzle_c], ...]` sets the nozzle temperature from each height up (temperature towers).
+- `retracts`: `[[height_mm, length_mm], ...]` changes the retraction length from each height up (retraction towers). Needs relative extrusion; every retraction, including the part done during a wipe, is scaled.
+
+The response lists what was applied in `temps_applied` and `retracts_applied`.
+
+### Profile updates
+
+Startup replaces a profile on the drive with the newly shipped one only when the drive copy is an unedited earlier version (its checksum is listed in `profiles/previous.md5`). A profile edited on the drive is left alone.

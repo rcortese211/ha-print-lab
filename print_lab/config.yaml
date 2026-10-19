@@ -1,5 +1,5 @@
 name: Print Lab
-version: "0.3.0"
+version: "0.4.0"
 slug: print_lab
 description: Headless PrusaSlicer + OpenSCAD, run from an external drive
 url: https://github.com/rcortese211/ha-print-lab

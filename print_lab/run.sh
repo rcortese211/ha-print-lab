@@ -93,11 +93,23 @@ if [ ! -f "$ROOT/.printlab-ai-ready" ]; then
     log "Detector installed."
 fi
 
-# ship code and default profiles (never overwrite a profile already on the drive)
+# ship code and default profiles. A profile on the drive is only replaced when it
+# is an unedited copy of an earlier shipped version (listed in previous.md5).
 mkdir -p "$ROOT/srv"
 cp /opt/printlab-files/server.py /opt/printlab-files/watch.py "$ROOT/srv/"
+PREV=/opt/printlab-files/profiles/previous.md5
 for p in /opt/printlab-files/profiles/*.ini; do
-    [ -f "$LAB/profiles/$(basename "$p")" ] || cp "$p" "$LAB/profiles/"
+    name=$(basename "$p"); dest="$LAB/profiles/$name"
+    if [ ! -f "$dest" ]; then
+        cp "$p" "$dest"
+    elif ! cmp -s "$p" "$dest"; then
+        sum=$(md5sum "$dest" | cut -d' ' -f1)
+        if [ -f "$PREV" ] && grep -q "^$sum $name\$" "$PREV"; then
+            cp "$p" "$dest"; log "Updated profile $name"
+        else
+            log "Profile $name was edited on the drive; leaving it alone"
+        fi
+    fi
 done
 
 log "Starting slice server on :8099"
