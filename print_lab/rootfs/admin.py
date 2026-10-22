@@ -96,23 +96,17 @@ def set_bot(lab: Path, cfg: dict) -> dict:
     """Save the Telegram bot's settings (bot.py notices the change and restarts itself)."""
     tg = str(cfg.get("telegram_token", ""))
     chats = cfg.get("chat_ids") or []
-    url = str(cfg.get("ha_url", ""))
-    ha = str(cfg.get("ha_token", ""))
     if not re.fullmatch(r"\d{5,15}:[A-Za-z0-9_-]{30,60}", tg):
         raise ValueError("telegram_token doesn't look like a BotFather token")
-    if not chats or not all(isinstance(c, int) for c in chats):
+    if not chats or not all(isinstance(c, int) and not isinstance(c, bool) for c in chats):
         raise ValueError("chat_ids must be a non-empty list of numbers")
-    if not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]_-]+(:\d+)?/?", url):
-        raise ValueError("ha_url must be like http://192.168.0.10:8123")
-    if len(ha) < 40:
-        raise ValueError("ha_token is missing")
     dest = lab / "bot.json"
     tmp = lab / "bot.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump({"telegram_token": tg, "chat_ids": chats, "ha_url": url, "ha_token": ha}, f)
+        json.dump({"telegram_token": tg, "chat_ids": chats}, f)
     os.replace(tmp, dest)
-    return {"ok": True, "chat_ids": len(chats), "ha_url": url}
+    return {"ok": True, "chat_ids": len(chats)}
 
 
 def update() -> dict:

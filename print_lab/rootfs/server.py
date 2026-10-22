@@ -10,6 +10,10 @@ Internal Supervisor network only. Endpoints:
   POST /detect           {stream_url} or a JPEG body; returns the failure score
   GET  /watch/last.jpg   the frame the last check looked at
   /admin/...             maintenance, only on a standalone machine (see admin.py)
+  /printer/...           direct printer control, standalone only, needs the admin token:
+    GET  status | files      POST config {host} | stage {gcode} | start {confirm, filename?}
+    POST stop | pause | resume | check (camera frame + failure score)
+  POST /slice with "stage": true also puts the result on the printer (needs the token)
 """
 import hashlib
 import json
@@ -18,12 +22,14 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import admin
+from printer import Printer, PrinterError
 from watch import Detector, WatchError
 
 LAB = Path(os.environ.get("PRINTLAB_DIR", "/lab"))
@@ -36,6 +42,51 @@ MAX_DOWNLOAD = 200 * 1024 * 1024
 LOCK = threading.Lock()
 DET_LOCK = threading.Lock()
 DETECTOR = Detector(LAB)
+PRINTER_CFG = LAB / "printer.json"
+STAGED = LAB / "staged.json"
+_PRINTER = None
+
+
+def printer():
+    global _PRINTER
+    try:
+        host = json.loads(PRINTER_CFG.read_text()).get("host")
+    except (OSError, ValueError):
+        host = None
+    if not host:
+        raise JobError("No printer address set yet (POST /printer/config)")
+    if _PRINTER is None or _PRINTER.host != host:
+        _PRINTER = Printer(host)
+    return _PRINTER
+
+
+def read_staged():
+    try:
+        return json.loads(STAGED.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def stage_gcode(name, extra=None):
+    """Put a sliced file from the drive on the printer and remember it as the staged one."""
+    path = GCODE / Path(str(name)).name
+    if not path.is_file() or path.suffix != ".gcode":
+        raise JobError(f"Print Lab has no {path.name}")
+    result = printer().stage(path.name, path.read_bytes())
+    STAGED.write_text(json.dumps({**result, **(extra or {}),
+                                  "staged_at": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    return result
+
+
+def check_camera():
+    """Score a live frame, starting the printer's camera stream first if it isn't running."""
+    p = printer()
+    try:
+        return DETECTOR.check(url=p.stream_url)
+    except WatchError:
+        p.kick_camera()
+        time.sleep(2)
+        return DETECTOR.check(url=p.stream_url)
 
 
 class JobError(Exception):
@@ -267,10 +318,60 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, getattr(admin, action)())
         self._send(404, {"error": "not found"})
 
+    def _printer(self, method):
+        if not admin.enabled():
+            return self._send(404, {"error": "not found"})
+        if not admin.authorised(self.headers.get("X-Admin-Token")):
+            return self._send(403, {"error": "forbidden"})
+        action = urllib.parse.urlsplit(self.path).path[len("/printer/"):]
+        try:
+            body = json.loads(self._body(64 * 1024) or b"{}") if method == "POST" else {}
+            if method == "GET" and action == "status":
+                return self._send(200, {**printer().status(), "staged": read_staged() or None})
+            if method == "GET" and action == "files":
+                return self._send(200, {"files": printer().files()})
+            if method == "POST" and action == "config":
+                host = str(body.get("host", ""))
+                if not re.fullmatch(r"[A-Za-z0-9.-]{1,64}", host):
+                    raise JobError("host must be an IP address or host name")
+                PRINTER_CFG.write_text(json.dumps({"host": host}))
+                return self._send(200, {"ok": True, "host": host})
+            if method == "POST" and action == "stage":
+                with LOCK:
+                    return self._send(200, stage_gcode(body.get("gcode", ""), {"source": "print_lab"}))
+            if method == "POST" and action == "start":
+                if body.get("confirm") is not True:
+                    raise JobError("Starting a print needs confirm: true")
+                staged = read_staged()
+                if not staged.get("filename"):
+                    raise JobError("Nothing is staged")
+                if body.get("filename") and body["filename"] != staged["filename"]:
+                    raise JobError("That file is not the staged one")
+                result = printer().start(staged, bool(body.get("auto_leveling", True)))
+                staged["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                STAGED.write_text(json.dumps(staged))
+                return self._send(200, result)
+            if method == "POST" and action in ("stop", "pause", "resume"):
+                return self._send(200, printer().control(action))
+            if method == "POST" and action == "check":
+                if not DET_LOCK.acquire(timeout=60):
+                    raise WatchError("Another check is still running")
+                try:
+                    return self._send(200, check_camera())
+                finally:
+                    DET_LOCK.release()
+            self._send(404, {"error": "not found"})
+        except (JobError, PrinterError, WatchError, ValueError) as err:
+            self._send(400, {"error": str(err)})
+        except Exception as err:  # noqa: BLE001
+            self._send(500, {"error": f"{type(err).__name__}: {err}"})
+
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         if path.startswith("/admin/"):
             return self._admin("GET")
+        if path.startswith("/printer/"):
+            return self._printer("GET")
         if path == "/health":
             free = shutil.disk_usage(LAB)
             return self._send(200, {"ok": True, "prusaslicer": version(["prusa-slicer", "--help"]),
@@ -296,19 +397,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urllib.parse.urlsplit(self.path).path.startswith("/admin/"):
             return self._admin("POST")
+        if urllib.parse.urlsplit(self.path).path.startswith("/printer/"):
+            return self._printer("POST")
         if urllib.parse.urlsplit(self.path).path == "/detect":
             return self._detect()
         if urllib.parse.urlsplit(self.path).path != "/slice":
             return self._send(404, {"error": "not found"})
         try:
             req = json.loads(self._body())
+            if req.get("stage") and not admin.authorised(self.headers.get("X-Admin-Token")):
+                return self._send(403, {"error": "staging on the printer needs the admin token"})
             if not LOCK.acquire(timeout=600):
                 raise JobError("Another slice is still running")
             try:
-                self._send(200, slice_job(req))
+                result = slice_job(req)
+                if req.get("stage"):
+                    result = {"sliced": result, "staged": stage_gcode(
+                        result["gcode"], {"estimated_time": result.get("estimated_time"),
+                                          "filament_g": result.get("filament_g"), "source": "print_lab"})}
+                self._send(200, result)
             finally:
                 LOCK.release()
-        except (JobError, ValueError, subprocess.TimeoutExpired) as err:
+        except (JobError, PrinterError, ValueError, subprocess.TimeoutExpired) as err:
             self._send(400, {"error": str(err)})
 
     def _detect(self):

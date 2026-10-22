@@ -11,11 +11,11 @@ chat ids in its config, and never starts or stops anything without a "yes".
   /stop /pause /resume
   yes / no       confirm or cancel the pending action
 
-Printer actions go through Home Assistant's API (the printer connection lives there);
-files and the camera frame come from Print Lab on this machine.
+Everything goes through Print Lab on this machine, which talks to the printer directly,
+so the bot keeps working when Home Assistant is down.
 
 Config: $PRINTLAB_DIR/bot.json, written by POST /admin/bot:
-  {"telegram_token": "...", "chat_ids": [123], "ha_url": "http://...:8123", "ha_token": "..."}
+  {"telegram_token": "...", "chat_ids": [123]}
 The bot waits until the file exists and restarts itself (via systemd) when it changes.
 """
 import html
@@ -35,8 +35,7 @@ LAB = Path(os.environ.get("PRINTLAB_DIR", "/var/lib/printlab"))
 CONFIG = LAB / "bot.json"
 LAB_URL = os.environ.get("PRINTLAB_URL", "http://127.0.0.1:8099")
 MODEL_EXT = (".stl", ".3mf", ".obj", ".step", ".stp")
-P = "sensor.anycubic_kobra_s1_"
-BUTTON = "button.anycubic_kobra_s1_"
+TOKEN = os.environ.get("PRINTLAB_ADMIN_TOKEN", "")
 CONFIRM_FOR = 15 * 60
 LINK_RE = re.compile(r"https?://\S+")
 
@@ -110,24 +109,15 @@ class Telegram:
              {"Content-Type": f"multipart/form-data; boundary={b}"}, timeout=60)
 
 
-class HomeAssistant:
-    def __init__(self, url, token):
-        self.url = url.rstrip("/")
-        self.h = {"Authorization": f"Bearer {token}"}
+class Lab:
+    """Print Lab on this machine (slicing, files, camera check and the printer itself)."""
+    h = {"X-Admin-Token": TOKEN}
 
-    def state(self, entity_id):
-        return http("GET", f"{self.url}/api/states/{entity_id}", headers=self.h, timeout=15)
+    def get(self, path, timeout=30, raw=False):
+        return http("GET", LAB_URL + path, headers=self.h, timeout=timeout, raw=raw)
 
-    def value(self, entity_id):
-        try:
-            return self.state(entity_id).get("state")
-        except Err:
-            return None
-
-    def call(self, domain, service, data=None, response=False, timeout=60):
-        q = "?return_response" if response else ""
-        r = http("POST", f"{self.url}/api/services/{domain}/{service}{q}", data or {}, self.h, timeout)
-        return (r or {}).get("service_response") if response else r
+    def post(self, path, body=None, timeout=60):
+        return http("POST", LAB_URL + path, body or {}, self.h, timeout)
 
 
 def safe_name(text):
@@ -135,9 +125,9 @@ def safe_name(text):
     return name or f"model_{int(time.time())}"
 
 
-def duration(hours):
+def duration(minutes):
     try:
-        m = round(float(hours) * 60)
+        m = round(float(minutes))
     except (TypeError, ValueError):
         return None
     return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
@@ -161,7 +151,7 @@ def find_model_link(url):
 class Bot:
     def __init__(self, cfg):
         self.tg = Telegram(cfg["telegram_token"])
-        self.ha = HomeAssistant(cfg["ha_url"], cfg["ha_token"])
+        self.lab = Lab()
         self.chats = {int(c) for c in cfg["chat_ids"]}
         self.pending = {}          # chat -> (action, arg, since)
         self.job = None            # thread doing a slice/stage
@@ -234,47 +224,46 @@ class Bot:
             self.tg.send(chat, "That was too long ago; ask again.")
             return
         if action == "start":
-            r = self.ha.call("kobra_print", "start", {"confirm": True, "filename": arg},
-                             response=True, timeout=120) or {}
+            r = self.lab.post("/printer/start", {"confirm": True, "filename": arg}, timeout=120) or {}
             self.tg.send(chat, f"Started {arg}." if r.get("printer_busy") else
                          f"Sent start for {arg}; the printer hasn't reported busy yet. /status in a minute.")
         elif action in ("stop", "pause", "resume"):
-            self.ha.call("button", "press", {"entity_id": BUTTON + action})
+            r = self.lab.post(f"/printer/{action}") or {}
             note = " (the printer ignores stop while it's still levelling/heating - try again once it prints)" \
                 if action == "stop" else ""
-            self.tg.send(chat, f"Sent {action}.{note}")
+            self.tg.send(chat, f"Sent {action}{'' if r.get('acknowledged') else ' (no acknowledgement yet)'}.{note}")
 
     # ------------------------------------------------------------- commands
     def status(self, chat):
         try:
-            st = self.ha.state(P + "status")
+            st = self.lab.get("/printer/status")
         except Err as err:
-            lines = [f"Can't reach Home Assistant: {err}"]
+            lines = [f"Can't reach the printer: {err}"]
             try:
-                h = http("GET", f"{LAB_URL}/health", timeout=10)
+                h = self.lab.get("/health", timeout=10)
                 lines.append(f"Print Lab is up (detector {h.get('detector')}, {h.get('drive_free_gb')} GB free).")
             except Err as e2:
                 lines.append(f"Print Lab isn't answering either: {e2}")
             self.tg.send(chat, "\n".join(lines))
             return
-        v = self.ha.value
         state = st.get("state")
-        lines = [f"Printer: {state}"]
-        if v("binary_sensor.anycubic_kobra_s1_printing") == "on" or state in ("printing", "paused", "preheating", "auto_leveling"):
-            lines.append(f"File: {v(P + 'file_name')}")
-            lines.append(f"Progress: {v(P + 'progress')}%  layer {v(P + 'current_layer')}/{v(P + 'total_layers')}")
-            left = duration(v(P + "time_remaining"))
+        job = st.get("job") or {}
+        lines = [f"Printer: {job.get('state') or state}"]
+        if job:
+            lines.append(f"File: {job.get('filename')}")
+            lines.append(f"Progress: {job.get('progress')}%  layer {job.get('curr_layer')}/{job.get('total_layers')}")
+            left = duration(job.get("remain_time"))
             if left:
                 lines.append(f"Time left: {left}")
-        lines.append(f"Nozzle {v(P + 'nozzle_temperature')}°C, bed {v(P + 'bed_temperature')}°C")
-        staged = v("sensor.kobra_print_staged")
-        if staged and staged != "none":
-            lines.append(f"Staged: {staged}")
+        lines.append(f"Nozzle {st.get('nozzle_c')}°C, bed {st.get('bed_c')}°C")
+        staged = st.get("staged") or {}
+        if staged.get("filename") and not staged.get("started_at"):
+            lines.append(f"Staged: {staged['filename']}")
         jpg = None
         try:
-            r = self.ha.call("kobra_print", "check_now", response=True, timeout=90) or {}
-            lines.append(f"Failure check: {r.get('score', 0):.2f} (fails at 0.6 sustained)")
-            jpg = http("GET", f"{LAB_URL}/watch/last.jpg", timeout=15, raw=True)
+            r = self.lab.post("/printer/check", timeout=90) or {}
+            lines.append(f"Failure check: {float(r.get('score') or 0):.2f} (fails at 0.6 sustained)")
+            jpg = self.lab.get("/watch/last.jpg", timeout=15, raw=True)
         except Err as err:
             lines.append(f"(no camera frame: {err})")
         if jpg:
@@ -283,7 +272,7 @@ class Bot:
             self.tg.send(chat, "\n".join(lines))
 
     def lab_files(self):
-        return http("GET", f"{LAB_URL}/files", timeout=15)
+        return self.lab.get("/files", timeout=15)
 
     def files(self, chat):
         f = self.lab_files()
@@ -305,16 +294,15 @@ class Bot:
         key = base.lower()
         if key in gcode:
             self.tg.send(chat, f"Putting {gcode[key]} on the printer...")
-            r = self.ha.call("kobra_print", "stage", {"file": gcode[key], "from_lab": True},
-                             response=True, timeout=600) or {}
+            r = self.lab.post("/printer/stage", {"gcode": gcode[key]}, timeout=600) or {}
             details = r.get("printer_details") or {}
-            est = duration((details.get("estimated_time_s") or 0) / 3600) if details.get("estimated_time_s") else None
+            est = duration(details["estimated_time_s"] / 60) if details.get("estimated_time_s") else None
             self.ready(chat, r.get("filename", gcode[key]), est, None)
         elif name.lower() in models or key in model_by_base:
             model = models.get(name.lower()) or model_by_base[key]
             self.tg.send(chat, f"Slicing {model} (a few minutes)...")
-            r = self.ha.call("kobra_print", "slice", {"name": safe_name(base), "model": model},
-                             response=True, timeout=1800) or {}
+            r = self.lab.post("/slice", {"name": safe_name(base), "model": model, "stage": True},
+                              timeout=1800) or {}
             s = r.get("sliced") or {}
             self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"), s.get("filament_g"))
         else:
@@ -333,8 +321,7 @@ class Bot:
         stem = os.path.basename(urllib.parse.urlsplit(file_url).path).rsplit(".", 1)[0]
         name = safe_name(urllib.parse.unquote(stem))
         self.tg.send(chat, f"Downloading and slicing {name} (a few minutes)...")
-        r = self.ha.call("kobra_print", "slice", {"name": name, "url": file_url},
-                         response=True, timeout=1800) or {}
+        r = self.lab.post("/slice", {"name": name, "url": file_url, "stage": True}, timeout=1800) or {}
         s = r.get("sliced") or {}
         self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"), s.get("filament_g"))
 

@@ -8,6 +8,10 @@ PROFILES_SRC=$REPO/print_lab/rootfs/profiles
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 
+# printer control needs MQTT + AES (Debian packages; the service's venv sees system packages)
+dpkg -s python3-paho-mqtt python3-cryptography >/dev/null 2>&1 || {
+    apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-paho-mqtt python3-cryptography; }
+
 # service account: no login, no shell
 id printlab >/dev/null 2>&1 || useradd --system --home-dir "$LAB" --shell /usr/sbin/nologin printlab
 usermod -aG systemd-journal,video printlab
