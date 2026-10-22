@@ -10,7 +10,7 @@ PROFILES_SRC=$REPO/print_lab/rootfs/profiles
 
 # service account: no login, no shell
 id printlab >/dev/null 2>&1 || useradd --system --home-dir "$LAB" --shell /usr/sbin/nologin printlab
-usermod -aG systemd-journal printlab
+usermod -aG systemd-journal,video printlab
 install -d -o printlab -g printlab "$LAB" "$LAB/models" "$LAB/gcode" "$LAB/profiles" "$LAB/work"
 
 # profiles: replace one on disk only if it is an unedited copy of an earlier shipped version
