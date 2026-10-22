@@ -1,0 +1,17 @@
+[Unit]
+Description=Print Lab Telegram bot
+After=network-online.target printlab.service
+Wants=network-online.target
+
+[Service]
+User=printlab
+Group=printlab
+EnvironmentFile=/etc/printlab/printlab.env
+Environment=HOME=/var/lib/printlab
+ExecStart=/usr/bin/python3 -u /opt/printlab/repo/print_lab/rootfs/bot.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

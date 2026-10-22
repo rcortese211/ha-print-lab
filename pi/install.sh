@@ -44,12 +44,12 @@ fi
 
 install -m 755 "$REPO/pi/printlab-update" /usr/local/sbin/printlab-update
 install -m 644 "$REPO/pi/printlab.service" "$REPO/pi/printlab-update.service" \
-    "$REPO/pi/printlab-update.timer" /etc/systemd/system/
+    "$REPO/pi/printlab-update.timer" "$REPO/pi/printlab-bot.service" /etc/systemd/system/
 install -m 440 "$REPO/pi/sudoers" /etc/sudoers.d/printlab.new
 visudo -cf /etc/sudoers.d/printlab.new && mv /etc/sudoers.d/printlab.new /etc/sudoers.d/printlab
 
 systemctl daemon-reload
-systemctl enable printlab.service printlab-update.timer
+systemctl enable printlab.service printlab-update.timer printlab-bot.service
 systemctl start printlab-update.timer
-systemctl restart printlab.service
+systemctl restart printlab.service printlab-bot.service
 echo "Print Lab installed; admin token is in /etc/printlab/printlab.env"

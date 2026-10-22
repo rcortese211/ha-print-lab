@@ -5,6 +5,7 @@ Internal Supervisor network only. Endpoints:
   POST /slice            {name, scad|url|model, profile?, overrides?}
   GET  /gcode/<name>
   GET  /profiles
+  GET  /files            models and sliced G-code on the drive, newest first
   PUT  /profiles/<name>  (body: ini text)
   POST /detect           {stream_url} or a JPEG body; returns the failure score
   GET  /watch/last.jpg   the frame the last check looked at
@@ -255,7 +256,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and action == "status":
             return self._send(200, admin.status(LAB))
         if method == "GET" and action == "logs":
-            return self._send(200, admin.logs(int((query.get("lines") or ["200"])[0])))
+            return self._send(200, admin.logs(int((query.get("lines") or ["200"])[0]),
+                                              (query.get("unit") or [admin.SERVICE])[0]))
+        if method == "POST" and action == "bot":
+            try:
+                return self._send(200, admin.set_bot(LAB, json.loads(self._body(64 * 1024))))
+            except (ValueError, JobError) as err:
+                return self._send(400, {"error": str(err)})
         if method == "POST" and action in ("update", "restart", "reboot"):
             return self._send(200, getattr(admin, action)())
         self._send(404, {"error": "not found"})
@@ -273,6 +280,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
         if path == "/profiles":
             return self._send(200, {"profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
+        if path == "/files":
+            def ls(folder, exts):
+                rows = [{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
+                        for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
+                return sorted(rows, key=lambda r: -r["mtime"])
+            return self._send(200, {"models": ls(MODELS, MODEL_EXT), "gcode": ls(GCODE, (".gcode",))})
         if path == "/watch/last.jpg" and (DETECTOR.dir / "last.jpg").is_file():
             return self._send(200, raw=(DETECTOR.dir / "last.jpg").read_bytes(), ctype="image/jpeg")
         m = re.fullmatch(r"/gcode/([A-Za-z0-9_-]{1,60}\.gcode)", path)
