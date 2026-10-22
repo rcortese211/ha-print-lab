@@ -24,7 +24,7 @@ MODEL_URL = "https://www.obico.io/static_pub/ml-models/model-weights-5a6b1be1fa.
 MODEL_SHA256 = "0a6ebd8e30dbf6a450c50f9c0a5406f04ba7eb1c99fd5996e888c78bb383b9aa"
 DET_THRESHOLD = 0.2
 NMS_THRESHOLD = 0.4
-THREADS = 2          # leave the other cores for Home Assistant
+THREADS = int(os.environ.get("WATCH_THREADS", "2"))   # 2 leaves cores for Home Assistant
 
 
 def parse_crops(text):

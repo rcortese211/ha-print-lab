@@ -8,6 +8,7 @@ Internal Supervisor network only. Endpoints:
   PUT  /profiles/<name>  (body: ini text)
   POST /detect           {stream_url} or a JPEG body; returns the failure score
   GET  /watch/last.jpg   the frame the last check looked at
+  /admin/...             maintenance, only on a standalone machine (see admin.py)
 """
 import hashlib
 import json
@@ -21,6 +22,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import admin
 from watch import Detector, WatchError
 
 LAB = Path(os.environ.get("PRINTLAB_DIR", "/lab"))
@@ -242,8 +244,26 @@ class Handler(BaseHTTPRequestHandler):
             raise JobError("Request too large")
         return self.rfile.read(n)
 
+    def _admin(self, method):
+        parts = urllib.parse.urlsplit(self.path)
+        if not admin.enabled():
+            return self._send(404, {"error": "not found"})
+        if not admin.authorised(self.headers.get("X-Admin-Token")):
+            return self._send(403, {"error": "forbidden"})
+        action = parts.path[len("/admin/"):]
+        query = urllib.parse.parse_qs(parts.query)
+        if method == "GET" and action == "status":
+            return self._send(200, admin.status(LAB))
+        if method == "GET" and action == "logs":
+            return self._send(200, admin.logs(int((query.get("lines") or ["200"])[0])))
+        if method == "POST" and action in ("update", "restart", "reboot"):
+            return self._send(200, getattr(admin, action)())
+        self._send(404, {"error": "not found"})
+
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/admin/"):
+            return self._admin("GET")
         if path == "/health":
             free = shutil.disk_usage(LAB)
             return self._send(200, {"ok": True, "prusaslicer": version(["prusa-slicer", "--help"]),
@@ -261,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path.startswith("/admin/"):
+            return self._admin("POST")
         if urllib.parse.urlsplit(self.path).path == "/detect":
             return self._detect()
         if urllib.parse.urlsplit(self.path).path != "/slice":

@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Print Lab from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/printlab-update

@@ -1,0 +1,2 @@
+# The Print Lab service may only restart itself, start an update, or reboot.
+printlab ALL=(root) NOPASSWD: /usr/bin/systemctl restart printlab, /usr/bin/systemctl start --no-block printlab-update.service, /usr/bin/systemctl reboot

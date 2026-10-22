@@ -1,0 +1,19 @@
+[Unit]
+Description=Print Lab (slicer + print failure check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=printlab
+Group=printlab
+EnvironmentFile=/etc/printlab/printlab.env
+Environment=PRINTLAB_REPO=/opt/printlab/repo
+Environment=HOME=/var/lib/printlab
+WorkingDirectory=/opt/printlab/repo/print_lab/rootfs
+ExecStart=/opt/ai/bin/python3 -u /opt/printlab/repo/print_lab/rootfs/server.py
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

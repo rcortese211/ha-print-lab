@@ -1,0 +1,14 @@
+#!/bin/sh
+# Pull Print Lab from GitHub; reinstall and restart only when the code changed.
+# Usage: printlab-update [--force]
+set -e
+REPO=/opt/printlab/repo
+before=$(git -C "$REPO" rev-parse HEAD)
+git -C "$REPO" pull --ff-only -q
+after=$(git -C "$REPO" rev-parse HEAD)
+if [ "$before" != "$after" ] || [ "${1:-}" = "--force" ]; then
+    echo "Updating $before -> $after"
+    "$REPO/pi/install.sh"
+else
+    echo "Already up to date ($after)"
+fi

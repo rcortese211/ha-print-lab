@@ -98,7 +98,7 @@ fi
 # ship code and default profiles. A profile on the drive is only replaced when it
 # is an unedited copy of an earlier shipped version (listed in previous.md5).
 mkdir -p "$ROOT/srv"
-cp /opt/printlab-files/server.py /opt/printlab-files/watch.py "$ROOT/srv/"
+cp /opt/printlab-files/server.py /opt/printlab-files/watch.py /opt/printlab-files/admin.py "$ROOT/srv/"
 PREV=/opt/printlab-files/profiles/previous.md5
 for p in /opt/printlab-files/profiles/*.ini; do
     name=$(basename "$p"); dest="$LAB/profiles/$name"
