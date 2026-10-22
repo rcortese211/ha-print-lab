@@ -255,7 +255,10 @@ class Bot:
             left = duration(job.get("remain_time"))
             if left:
                 lines.append(f"Time left: {left}")
-        lines.append(f"Nozzle {st.get('nozzle_c')}°C, bed {st.get('bed_c')}°C")
+        def temp(now, target):
+            return f"{now}°C → {target}°C" if target else f"{now}°C"
+        lines.append(f"Nozzle {temp(st.get('nozzle_c'), st.get('nozzle_target_c'))}, "
+                     f"bed {temp(st.get('bed_c'), st.get('bed_target_c'))}")
         staged = st.get("staged") or {}
         if staged.get("filename") and not staged.get("started_at"):
             lines.append(f"Staged: {staged['filename']}")
