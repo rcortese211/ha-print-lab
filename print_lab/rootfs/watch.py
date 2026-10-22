@@ -11,6 +11,7 @@ Model: https://github.com/TheSpaghettiDetective/obico-server (ml_api), AGPL-3.0.
 """
 import hashlib
 import ipaddress
+import os
 import shutil
 import subprocess
 import threading
@@ -23,6 +24,27 @@ MODEL_URL = "https://www.obico.io/static_pub/ml-models/model-weights-5a6b1be1fa.
 MODEL_SHA256 = "0a6ebd8e30dbf6a450c50f9c0a5406f04ba7eb1c99fd5996e888c78bb383b9aa"
 DET_THRESHOLD = 0.2
 NMS_THRESHOLD = 0.4
+THREADS = 2          # leave the other cores for Home Assistant
+
+
+def parse_crops(text):
+    """'x,y,w,h;x,y,w,h' as fractions of the frame -> [(x, y, w, h), ...]."""
+    crops = []
+    for part in (text or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        x, y, w, h = (float(v) for v in part.split(","))
+        if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 - x + 1e-6 and 0 < h <= 1 - y + 1e-6):
+            raise ValueError(f"bad crop {part}")
+        crops.append((x, y, w, h))
+    return crops
+
+
+# The print sits in the middle of a wide camera view, small enough that the whole
+# frame shrunk to the model's input hides it. Each crop is scored at the model's
+# full resolution as well as the whole frame; the frame's score is the highest one.
+DEFAULT_CROPS = "0.2,0.15,0.6,0.6;0.2,0.4,0.6,0.6"
 
 
 class WatchError(Exception):
@@ -58,7 +80,7 @@ class Detector:
                 tmp.replace(self.model_path)
             import onnxruntime  # noqa: PLC0415  (only needed once the model is wanted)
             opts = onnxruntime.SessionOptions()
-            opts.intra_op_num_threads = 3      # leave a core for Home Assistant
+            opts.intra_op_num_threads = THREADS
             self._session = onnxruntime.InferenceSession(
                 str(self.model_path), opts, providers=["CPUExecutionProvider"])
             self.status = "ready"
@@ -97,14 +119,25 @@ class Detector:
             raise WatchError("Could not grab a camera frame: " + (p.stderr.strip()[-300:] or "no output"))
 
     # ------------------------------------------------------------------ inference
-    def detect(self, jpg: Path) -> dict:
+    @staticmethod
+    def frame_size(jpg: Path) -> tuple[int, int]:
+        p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=width,height", "-of", "csv=p=0:s=x", str(jpg)],
+                           capture_output=True, text=True, timeout=20)
+        try:
+            w, h = (int(v) for v in p.stdout.strip().split("x")[:2])
+        except ValueError as err:
+            raise WatchError("Could not read the camera frame size") from err
+        return w, h
+
+    def _score_view(self, jpg: Path, vf_crop: str | None) -> tuple[list, float]:
         import numpy as np  # noqa: PLC0415
-        self.ensure_model()
         sess = self._session
         inp = sess.get_inputs()[0]
         h, w = int(inp.shape[2]), int(inp.shape[3])
+        vf = (vf_crop + "," if vf_crop else "") + f"scale={w}:{h}"
         raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(jpg),
-                              "-vf", f"scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                              "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                              capture_output=True, timeout=30).stdout
         if len(raw) != w * h * 3:
             raise WatchError("Could not decode the camera frame")
@@ -117,13 +150,32 @@ class Detector:
         confs = np.asarray(out[1])[0].max(axis=1)       # [N]
         keep = confs > DET_THRESHOLD
         boxes, confs = boxes[keep], confs[keep]
-        dets = []
-        for i in self._nms(boxes, confs):
-            x1, y1, x2, y2 = (float(v) for v in boxes[i])
-            dets.append({"conf": round(float(confs[i]), 3),
-                         "box": [round(x1, 3), round(y1, 3), round(x2, 3), round(y2, 3)]})
-        score = round(sum(d["conf"] for d in dets), 3)
-        return {"score": score, "detections": dets, "inference_s": round(took, 2)}
+        dets = [(boxes[i], float(confs[i])) for i in self._nms(boxes, confs)]
+        return dets, took
+
+    def detect(self, jpg: Path, crops=None) -> dict:
+        """Score the whole frame and each crop; the frame's score is the best view's."""
+        self.ensure_model()
+        if crops is None:
+            crops = parse_crops(os.environ.get("WATCH_CROPS", DEFAULT_CROPS))
+        views = [("full", None, (0.0, 0.0, 1.0, 1.0))]
+        for i, (x, y, w, h) in enumerate(crops, 1):
+            views.append((f"crop{i}", f"crop=iw*{w}:ih*{h}:iw*{x}:ih*{y}", (x, y, w, h)))
+        total_s, per_view, best = 0.0, {}, ("full", 0.0, [])
+        for name, vf, (x, y, w, h) in views:
+            dets, took = self._score_view(jpg, vf)
+            total_s += took
+            mapped = [{"conf": round(c, 3), "view": name,
+                       "box": [round(x + b[0] * w, 3), round(y + b[1] * h, 3),
+                               round(x + b[2] * w, 3), round(y + b[3] * h, 3)]} for b, c in dets]
+            score = round(sum(d["conf"] for d in mapped), 3)
+            per_view[name] = score
+            if score > best[1]:
+                best = (name, score, mapped)
+        fw, fh = self.frame_size(jpg)
+        return {"score": best[1], "view": best[0], "views": per_view, "detections": best[2],
+                "inference_s": round(total_s, 2), "frame_size": [fw, fh],
+                "crops": [list(c) for c in crops]}
 
     @staticmethod
     def _nms(boxes, confs):
@@ -145,14 +197,14 @@ class Detector:
         return keep
 
     # ------------------------------------------------------------------ one check
-    def check(self, url: str | None = None, jpeg: bytes | None = None) -> dict:
+    def check(self, url: str | None = None, jpeg: bytes | None = None, crops=None) -> dict:
         frame = self.dir / "last.jpg"
         if jpeg is not None:
             frame.parent.mkdir(parents=True, exist_ok=True)
             frame.write_bytes(jpeg)
         else:
             self.grab(self.check_stream_url(url), frame)
-        result = self.detect(frame)
+        result = self.detect(frame, crops)
         result["frame"] = "last.jpg"
         result["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if result["score"] > 0.3:

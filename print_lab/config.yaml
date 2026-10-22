@@ -1,5 +1,5 @@
 name: Print Lab
-version: "0.4.1"
+version: "0.5.0"
 slug: print_lab
 description: Headless PrusaSlicer + OpenSCAD, run from an external drive
 url: https://github.com/rcortese211/ha-print-lab
@@ -16,7 +16,9 @@ options:
   drive_label: HA_Expand
   rootfs_gb: 12
   debian_suite: trixie
+  watch_crops: "0.2,0.15,0.6,0.6;0.2,0.4,0.6,0.6"
 schema:
   drive_label: str
   rootfs_gb: int(4,64)
   debian_suite: str
+  watch_crops: str?

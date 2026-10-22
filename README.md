@@ -45,3 +45,7 @@ The response lists what was applied in `temps_applied` and `retracts_applied`.
 ### Profile updates
 
 Startup replaces a profile on the drive with the newly shipped one only when the drive copy is an unedited earlier version (its checksum is listed in `profiles/previous.md5`). A profile edited on the drive is left alone.
+
+### Close-up crops for the failure check
+
+A print is small in the camera's wide view, and shrinking the whole frame to the model's input size can hide a failure entirely. The check therefore scores the whole frame plus a few crops of it at the model's full resolution, and the frame's score is the best view's. The crops are set with the `watch_crops` option as `x,y,w,h` fractions of the frame, separated by `;`. The response lists every view's score in `views` and which one won in `view`.
