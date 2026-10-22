@@ -9,7 +9,7 @@ LABEL=$(jq -r '.drive_label // "HA_Expand"' "$OPTS")
 ROOT_GB=$(jq -r '.rootfs_gb // 12' "$OPTS")
 SUITE=$(jq -r '.debian_suite // "trixie"' "$OPTS")
 # areas of the camera frame the failure check also scores up close (x,y,w,h fractions)
-export WATCH_CROPS=$(jq -r '.watch_crops // "0.2,0.15,0.6,0.6;0.2,0.4,0.6,0.6"' "$OPTS")
+export WATCH_CROPS=$(jq -r '.watch_crops // "0.28,0.2,0.42,0.42;0.28,0.45,0.42,0.42"' "$OPTS")
 MIRROR=https://deb.debian.org/debian
 
 DRIVE=/mnt/drive

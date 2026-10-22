@@ -44,7 +44,7 @@ def parse_crops(text):
 # The print sits in the middle of a wide camera view, small enough that the whole
 # frame shrunk to the model's input hides it. Each crop is scored at the model's
 # full resolution as well as the whole frame; the frame's score is the highest one.
-DEFAULT_CROPS = "0.2,0.15,0.6,0.6;0.2,0.4,0.6,0.6"
+DEFAULT_CROPS = "0.28,0.2,0.42,0.42;0.28,0.45,0.42,0.42"
 
 
 class WatchError(Exception):
