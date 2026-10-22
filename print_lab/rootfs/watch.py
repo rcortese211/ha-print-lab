@@ -150,7 +150,7 @@ class Detector:
         confs = np.asarray(out[1])[0].max(axis=1)       # [N]
         keep = confs > DET_THRESHOLD
         boxes, confs = boxes[keep], confs[keep]
-        dets = [(boxes[i], float(confs[i])) for i in self._nms(boxes, confs)]
+        dets = [([float(v) for v in boxes[i]], float(confs[i])) for i in self._nms(boxes, confs)]
         return dets, took
 
     def detect(self, jpg: Path, crops=None) -> dict:
