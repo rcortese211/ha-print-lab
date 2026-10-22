@@ -287,6 +287,9 @@ class Handler(BaseHTTPRequestHandler):
                     result = DETECTOR.check(url=str(json.loads(self._body()).get("stream_url", "")))
             finally:
                 DET_LOCK.release()
+            print(f"[print_lab] check: score {result['score']} (best {result.get('view')}) "
+                  f"views {result.get('views')} in {result.get('inference_s')}s "
+                  f"frame {result.get('frame_size')}", flush=True)
             self._send(200, result)
         except (WatchError, JobError, ValueError, subprocess.TimeoutExpired) as err:
             self._send(400, {"error": str(err)})
