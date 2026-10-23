@@ -384,13 +384,23 @@ def solve(frames: list[tuple[float, Path]]) -> dict:
             "max_px": round(float(err.max()), 2)}
 
 
+MAX_RMS_PX = 6.0
+
+
 def load(path: Path):
     """(Camera or None, calibration dict or None)."""
     try:
         cal = json.loads(path.read_text())
-        return (Camera(cal["P"], cal.get("k1", 0.0)) if cal.get("P") else None), cal
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError):
         return None, None
+    # a solve that misses its own markers by more than a few pixels would put the expected
+    # print in the wrong place and make the plate guard see "debris" everywhere: don't use it
+    if not cal.get("P") or float(cal.get("rms_px", 99)) > MAX_RMS_PX:
+        return None, cal
+    try:
+        return Camera(cal["P"], cal.get("k1", 0.0)), cal
+    except (KeyError, ValueError):
+        return None, cal
 
 
 def draw_overlay(jpg: Path, cam, out: Path, bed_z: float = DWELLS[0][0]) -> None:
