@@ -42,6 +42,9 @@ CONFIRM_FOR = 15 * 60
 LINK_RE = re.compile(r"https?://\S+")
 # Quality presets for links, as overrides on the tuned profile (pla_08, 0.8 mm nozzle). Its
 # flow cap (15 mm3/s) sets the real speed, so these change layers, walls, infill and ironing.
+INFILLS = tuple(range(10, 101, 10))
+INFILL_RE = re.compile(r"\d{2,3}%?")
+
 QUALITY = {
     "fast": ("Fast", {"layer_height": "0.5", "fill_density": "10%", "ironing": "0",
                       "top_solid_layers": "3"}),
@@ -240,6 +243,8 @@ class Bot:
                 self.tg.send(chat, "Cancelled." if self.pending.pop(chat, None) else "Nothing was waiting.")
             elif word in QUALITY:
                 self.choose_quality(chat, word)
+            elif INFILL_RE.fullmatch(word) and self.pending.get(chat, ("",))[0] == "infill":
+                self.choose_infill(chat, int(word.rstrip("%")))
             elif LINK_RE.search(text):
                 self.background(chat, self.stage_links, (parse_links(text), LINK_RE.sub(" ", text).strip()))
             elif self.pending.get(chat, ("",))[0] == "pick":
@@ -265,6 +270,13 @@ class Bot:
             except Err:
                 pass
             self.choose_quality(chat, data[2:])
+        elif data.startswith("i:") and data[2:].isdigit():
+            try:
+                self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "reply_markup": {"inline_keyboard": []}})
+            except Err:
+                pass
+            self.choose_infill(chat, int(data[2:]))
 
     def background(self, chat, fn, arg):
         if self.job and self.job.is_alive():
@@ -488,16 +500,32 @@ class Bot:
         if action != "quality" or time.time() - since > CONFIRM_FOR:
             self.tg.send(chat, "Send me a link (or /print a model) first.")
             return
+        # second question: infill, 10-100 % in steps of 10
+        self.pending[chat] = ("infill", (arg[0], arg[1], key), time.time())
+        self.tg.buttons(chat, f"{QUALITY[key][0]}. How much infill?",
+                        [[(f"{n}%", f"i:{n}") for n in INFILLS[:5]],
+                         [(f"{n}%", f"i:{n}") for n in INFILLS[5:]]])
+
+    def choose_infill(self, chat, pct):
+        action, arg, since = self.pending.get(chat, (None, None, 0))
+        if action != "infill" or time.time() - since > CONFIRM_FOR:
+            self.tg.send(chat, "Send me a link (or /print a model) first.")
+            return
+        if pct not in INFILLS:
+            self.tg.send(chat, "Infill goes from 10% to 100% in steps of 10.")
+            return
         del self.pending[chat]
-        self.background(chat, self.slice_plate, (arg[0], arg[1], key))
+        self.background(chat, self.slice_plate, (*arg, pct))
 
     def slice_plate(self, chat, job):
-        items, labels, key = job
+        items, labels, key, infill = job
         label, overrides = QUALITY[key]
         name = plate_name(labels)
-        self.tg.send(chat, f"Slicing {describe(labels)} ({label}, a few minutes)...")
-        # PrusaSlicer applies the preset as overrides; OrcaSlicer uses Anycubic's own process
-        body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides}
+        self.tg.send(chat, f"Slicing {describe(labels)} ({label}, {infill}% infill, a few minutes)...")
+        # PrusaSlicer applies the preset as overrides; OrcaSlicer uses Anycubic's own process.
+        # The infill answer goes on top of either.
+        body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides,
+                "overrides": {"fill_density": f"{infill}%"}}
         if len(items) == 1 and items[0]["count"] == 1:
             body.update({k: v for k, v in items[0].items() if k != "count"})
         else:
@@ -511,6 +539,8 @@ class Bot:
                              f"({o['before']['contact_mm2']:.0f} → {o['contact_mm2']:.0f} mm² on the bed).")
         if s.get("supports"):
             notes.append("Supports are on: some overhangs can't print without them.")
+        if s.get("brim"):
+            notes.append("Brim added: tall or small-footprint pieces hold on better with one.")
         self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"),
                    s.get("filament_g"), s.get("preview"), describe(labels), notes)
 

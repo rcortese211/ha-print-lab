@@ -336,7 +336,7 @@ def slice_job(req):
     # some PrusaSlicer builds)
     out = GCODE / f"{name}.gcode"
     pieces = len(inputs)
-    orientation, supports = {}, False
+    orientation, supports, needs_brim = {}, False, False
     readable = all(Path(p).suffix.lower() in (".stl", ".3mf", ".obj") for p in inputs)
     want_orient = req.get("orient", True) is not False
     if readable and (pieces > 1 or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
@@ -350,6 +350,12 @@ def slice_job(req):
                     supports |= info["needs_supports"]
                 meshes[p] = tris
             laid = mesh.arrange([meshes[p] for p in inputs])
+            # tall or tiny footprints (chess pieces, keycaps): a brim keeps them on the bed
+            for part in laid:
+                lo, hi = part.reshape(-1, 3).min(0), part.reshape(-1, 3).max(0)
+                w, d, h = hi - lo
+                if h > 1.5 * min(w, d) or w * d < 400:
+                    needs_brim = True
         except mesh.MeshError as err:
             raise JobError(f"Couldn't lay out the plate: {err}") from err
         if engine == "orca":
@@ -381,6 +387,8 @@ def slice_job(req):
         # grid supports: the organic style's tips can't be thinner than a 0.8 mm nozzle's line
         overrides.update({"support_material": "1", "support_material_auto": "1",
                           "support_material_style": "grid"})
+    if needs_brim and "brim_width" not in overrides:
+        overrides["brim_width"] = "5"
     for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
             raise JobError(f"Bad override {k}={v}")
@@ -458,6 +466,7 @@ def slice_job(req):
             "slicer": engine, "orca": orca_info,
             "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
             "supports": overrides.get("support_material") == "1",
+            "brim": float(overrides.get("brim_width") or 0) > 0,
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
             "retracts_applied": retracts_applied}
 
