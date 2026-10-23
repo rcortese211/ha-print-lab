@@ -305,7 +305,8 @@ class Printer:
     def stage(self, name: str, data: bytes) -> dict:
         if not NAME_RE.fullmatch(name):
             raise PrinterError("File name must be a plain ASCII name ending in .gcode")
-        if b"G9111 " not in data[:20000]:
+        first_layer = data.find(b";LAYER_CHANGE")   # Orca: thumbnails + object list come first
+        if b"G9111 " not in data[:first_layer if first_layer > 0 else 2_000_000]:
             raise PrinterError("G-code was not sliced with the Kobra S1 profile (no G9111 start)")
         md5 = hashlib.md5(data).hexdigest()
 
