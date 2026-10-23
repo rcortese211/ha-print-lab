@@ -31,6 +31,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+import sources
+
 LAB = Path(os.environ.get("PRINTLAB_DIR", "/var/lib/printlab"))
 CONFIG = LAB / "bot.json"
 LAB_URL = os.environ.get("PRINTLAB_URL", "http://127.0.0.1:8099")
@@ -55,6 +57,7 @@ HELP = (
     "/print <name> - put a Print Lab file on the printer\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
+    "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large\n"
     "/print hook x3, clip x5 - same with models Print Lab already has\n"
     "/pause  /resume  /stop\n"
     "Nothing starts or stops until you reply yes."
@@ -191,21 +194,6 @@ def describe(labels):
     return ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in labels)
 
 
-def find_model_link(url):
-    """A direct model link as-is; for a web page, the first model file it links to."""
-    path = urllib.parse.urlsplit(url).path.lower()
-    if path.endswith(MODEL_EXT):
-        return url
-    try:
-        page = http("GET", url, headers={"User-Agent": "Mozilla/5.0 PrintLab"}, timeout=30, raw=True)
-    except Err:
-        return None
-    text = html.unescape(page[:3_000_000].decode(errors="ignore"))
-    for m in re.finditer(r"""https?://[^\s"'<>]+?\.(?:3mf|stl|obj|step|stp)(?:\?[^\s"'<>]*)?""", text, re.I):
-        return m.group(0)
-    return None
-
-
 class Bot:
     def __init__(self, cfg):
         self.tg = Telegram(cfg["telegram_token"])
@@ -248,7 +236,9 @@ class Bot:
             elif word in QUALITY:
                 self.choose_quality(chat, word)
             elif LINK_RE.search(text):
-                self.background(chat, self.stage_links, parse_links(text))
+                self.background(chat, self.stage_links, (parse_links(text), LINK_RE.sub(" ", text).strip()))
+            elif self.pending.get(chat, ("",))[0] == "pick":
+                self.background(chat, self.pick_files, text)
             else:
                 self.tg.send(chat, "Not sure what you mean. /help lists what I can do.")
         except Err as err:
@@ -279,7 +269,7 @@ class Bot:
         def run():
             try:
                 fn(chat, arg)
-            except Err as err:
+            except (Err, sources.SourceError) as err:
                 self.tg.send(chat, f"That didn't work: {err}")
             except Exception as err:  # noqa: BLE001
                 log("job crashed:", repr(err))
@@ -397,22 +387,71 @@ class Bot:
             return
         self.ask_quality(chat, items, labels)
 
-    def stage_links(self, chat, links):
+    def stage_links(self, chat, job):
+        links, words = job
         self.tg.send(chat, "Looking at that link..." if len(links) == 1 else f"Looking at {len(links)} links...")
-        items, labels, bad = [], [], []
-        for url, count in links:
-            file_url = find_model_link(url)
-            if not file_url:
-                bad.append(url)
+        if len(links) == 1:
+            url, count = links[0]
+            title, cands = sources.resolve(url)
+            selection = sources.parse_selection(words) if words else []
+            if not selection and len(cands) == 1:
+                return self.fetch_and_ask(chat, [(cands[0], count)])
+            if not selection:
+                return self.list_files_to_pick(chat, title, cands)
+            picked, problems = sources.match(selection, cands)
+            if problems or not picked:
+                return self.list_files_to_pick(chat, title, cands, problems)
+            return self.fetch_and_ask(chat, picked)
+        picked, problems = [], []
+        for n, (url, count) in enumerate(links, 1):
+            try:
+                _title, cands = sources.resolve(url)
+            except sources.SourceError as err:
+                problems.append(f"link {n}: {err}")
                 continue
-            fname = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(file_url).path))
-            items.append({"url": file_url, "count": count})
-            labels.append((fname.rsplit(".", 1)[0], count))
-        if bad:
-            self.tg.send(chat, "I couldn't find a model file behind:\n" + "\n".join(bad) + "\nSend the direct "
-                               "download link to the STL/3MF (on Printables or Thingiverse: right-click the "
-                               "file's download button and copy the link).")
+            if len(cands) == 1:
+                picked.append((cands[0], count))
+            else:
+                problems.append(f"link {n} has {len(cands)} files - send it on its own and say which ones")
+        if problems:
+            self.tg.send(chat, "Couldn't do that batch:\n" + "\n".join(problems))
             return
+        self.fetch_and_ask(chat, picked)
+
+    def list_files_to_pick(self, chat, title, cands, problems=None):
+        self.pending[chat] = ("pick", (title, cands), time.time())
+        lines = [f"Hmm: {'; '.join(problems)}.", ""] if problems else []
+        lines.append(f"{title} has {len(cands)} files:")
+        for i, c in enumerate(cands, 1):
+            lines.append(f"  {i}. {c.name}" + (f"  ({max(1, round(c.size / 1024))} KB)" if c.size else ""))
+        lines.append('Which ones, and how many? e.g. "2 small, 2 large" or "1 x2, 2 x2"')
+        self.tg.send(chat, "\n".join(lines))
+
+    def pick_files(self, chat, text):
+        _action, (title, cands), _since = self.pending[chat]
+        picked, problems = sources.match(sources.parse_selection(text), cands)
+        if problems or not picked:
+            return self.list_files_to_pick(chat, title, cands, problems or ["I didn't catch which files"])
+        del self.pending[chat]
+        self.fetch_and_ask(chat, picked)
+
+    def fetch_and_ask(self, chat, picked):
+        """Download the chosen files into Print Lab's models folder, then ask for the quality."""
+        models = LAB / "models"
+        items, labels = [], []
+        for cand, count in picked:
+            ext = os.path.splitext(cand.name)[1].lower()
+            fname = safe_name(cand.stem) + ext
+            dest = models / fname
+            if not dest.is_file() or (cand.size and dest.stat().st_size != cand.size):
+                data = cand.get()
+                if not data:
+                    raise Err(f"{cand.name} downloaded empty")
+                tmp = models / f".{fname}.part"
+                tmp.write_bytes(data)
+                tmp.replace(dest)
+            items.append({"model": fname, "count": count})
+            labels.append((cand.stem, count))
         self.ask_quality(chat, items, labels)
 
     def ask_quality(self, chat, items, labels):
