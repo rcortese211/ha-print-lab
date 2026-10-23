@@ -87,8 +87,8 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 if id robbie >/dev/null 2>&1; then
     install -d -o robbie -g robbie /home/robbie/printlab-agent
-    [ -f /home/robbie/printlab-agent/CLAUDE.md ] || \
-        install -o robbie -g robbie -m 644 "$REPO/pi/agent-CLAUDE.md" /home/robbie/printlab-agent/CLAUDE.md
+    # kept in the repo (pi/agent-CLAUDE.md), so it's refreshed on every update
+    install -o robbie -g robbie -m 644 "$REPO/pi/agent-CLAUDE.md" /home/robbie/printlab-agent/CLAUDE.md
     install -m 644 "$REPO/pi/printlab-claude.service" /etc/systemd/system/
 fi
 
