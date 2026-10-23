@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -523,4 +524,16 @@ if __name__ == "__main__":
             print(f"[print_lab] detector not ready: {err}", flush=True)
 
     threading.Thread(target=_warm, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
+    class DualStackServer(ThreadingHTTPServer):
+        """Answer on IPv4 and IPv6: printlab.local can resolve to either."""
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+
+    try:
+        server = DualStackServer(("::", 8099), Handler)
+    except OSError:                       # no IPv6 on this machine
+        server = ThreadingHTTPServer(("0.0.0.0", 8099), Handler)
+    server.serve_forever()
