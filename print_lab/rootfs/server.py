@@ -252,10 +252,15 @@ def slice_job(req):
         args += ["--load", str(extra)]
     args += layout
     args += ["--output", str(out), *inputs]
+    out.unlink(missing_ok=True)
     try:
-        run(args)
+        p = run(args)
     except JobError:
-        run(["xvfb-run", "-a", *args])  # some builds want a display even headless
+        p = run(["xvfb-run", "-a", *args])  # some builds want a display even headless
+    if not out.is_file():
+        tail = " | ".join((p.stdout + p.stderr).strip().splitlines()[-6:])
+        raise JobError(f"The slicer finished without making G-code: {tail or 'no message'}"
+                       + (f" (orientation: {json.dumps(orientation)})" if orientation else ""))
 
     data = out.read_bytes()
     cut = data.find(b"; prusaslicer_config = begin")
