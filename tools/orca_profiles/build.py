@@ -1,11 +1,12 @@
 """Build Print Lab's Kobra S1 0.8 mm OrcaSlicer profiles from Anycubic's own Orca profiles.
-# The Orca CLI only accepts a process whose compatible_printers names the machine's "system" name,
-# so these are marked from=system (the CLI then uses each profile's own name).
 
 Machine: Anycubic Kobra S1 (0.4) with the nozzle-dependent values of the S1 Max 0.8 profile.
 Process/filament: Anycubic's S1 Max 0.8 nozzle profiles (same S1-family hotend and nozzle),
 with the S1's own exhaust-fan values.
 """
+# The Orca CLI only accepts a process whose compatible_printers names the machine's "system" name,
+# so these are marked from=system (the CLI then uses each profile's own name). "nil" values mean
+# "use the default" in the GUI but are rejected by the CLI, so they're dropped.
 import json, sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from flatten import flat
@@ -37,6 +38,9 @@ f.update(compatible_printers=[NAME], inherits="", **{"from": "system"},
 f.pop("setting_id", None)
 out["filament_pla"] = f
 os.makedirs(sys.argv[1], exist_ok=True)
+def no_nil(d):
+    return {k: v for k, v in d.items() if v != "nil" and v != ["nil"]}
 for k, v in out.items():
+    v = no_nil(v)
     json.dump(v, open(os.path.join(sys.argv[1], f"{k}.json"), "w"), indent=1, sort_keys=True)
 print("wrote", list(out))
