@@ -52,8 +52,37 @@ install -m 644 "$REPO/pi/printlab.service" "$REPO/pi/printlab-update.service" \
 install -m 440 "$REPO/pi/sudoers" /etc/sudoers.d/printlab.new
 visudo -cf /etc/sudoers.d/printlab.new && mv /etc/sudoers.d/printlab.new /etc/sudoers.d/printlab
 
+# Claude Code (Anthropic's signed apt repository), for a Remote Control session on this Pi
+if ! command -v claude >/dev/null 2>&1; then
+    command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc.new
+    if gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc.new 2>/dev/null \
+            | grep -q '^fpr:::::::::31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE:'; then
+        mv /etc/apt/keyrings/claude-code.asc.new /etc/apt/keyrings/claude-code.asc
+        echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+            > /etc/apt/sources.list.d/claude-code.list
+        apt-get update -qq && apt-get install -y -qq claude-code
+    else
+        rm -f /etc/apt/keyrings/claude-code.asc.new
+        echo "Claude Code signing key didn't match; not installing Claude Code"
+    fi
+fi
+if id robbie >/dev/null 2>&1; then
+    install -d -o robbie -g robbie /home/robbie/printlab-agent
+    [ -f /home/robbie/printlab-agent/CLAUDE.md ] || \
+        install -o robbie -g robbie -m 644 "$REPO/pi/agent-CLAUDE.md" /home/robbie/printlab-agent/CLAUDE.md
+    install -m 644 "$REPO/pi/printlab-claude.service" /etc/systemd/system/
+fi
+
 systemctl daemon-reload
 systemctl enable printlab.service printlab-update.timer printlab-bot.service
 systemctl start printlab-update.timer
 systemctl restart printlab.service printlab-bot.service
+# Claude's Remote Control server: Robbie enables it once after logging in (pi/README.md);
+# after that, updates keep Claude Code current and restart it
+if systemctl is-enabled --quiet printlab-claude.service 2>/dev/null; then
+    apt-get install -y -qq --only-upgrade claude-code || true
+    systemctl restart printlab-claude.service || true
+fi
 echo "Print Lab installed; admin token is in /etc/printlab/printlab.env"

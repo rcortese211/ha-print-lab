@@ -29,3 +29,16 @@ One-time setup on Raspberry Pi OS (64-bit, Lite is fine), as a sudo user:
 
       LABEL=HA_Expand /mnt/ha_expand exfat nofail,noatime,uid=<printlab uid>,gid=<printlab gid>,dmask=027,fmask=137,x-systemd.device-timeout=20s 0 0
       /mnt/ha_expand/printlab /var/lib/printlab none bind,nofail 0 0
+
+## Claude Code on the Pi (Remote Control)
+
+`install.sh` installs Claude Code from Anthropic's signed apt repository and sets up
+`/home/robbie/printlab-agent` (with a `CLAUDE.md` describing this Pi) and `printlab-claude.service`.
+One-time setup, from a terminal on the Pi as robbie (`ssh printlab`):
+
+    cd ~/printlab-agent
+    claude                      # log in (/login), trust the folder, then /exit
+    claude remote-control --name "Print Lab Pi"   # answer y once, then Ctrl+C
+    sudo systemctl enable --now printlab-claude
+
+The session then shows up in claude.ai/code and the Claude app as "Print Lab Pi".

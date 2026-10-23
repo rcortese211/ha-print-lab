@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code on the Print Lab Pi (Remote Control server)
+After=network-online.target printlab.service
+Wants=network-online.target
+# Enabled by hand once robbie has logged in and approved Remote Control (see pi/README.md)
+
+[Service]
+User=robbie
+Group=robbie
+WorkingDirectory=/home/robbie/printlab-agent
+Environment=HOME=/home/robbie
+ExecStart=/usr/bin/claude remote-control --name "Print Lab Pi"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
