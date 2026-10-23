@@ -416,7 +416,10 @@ def slice_job(req):
     if cut > 0:
         data = data[:cut]
         out.write_bytes(data)
-    if b"G9111 " not in data[:20000]:
+    # the start block comes before the first layer; Orca puts thumbnails and one
+    # EXCLUDE_OBJECT_DEFINE per piece ahead of it, so on a big plate it sits well past 20 kB
+    first_layer = data.find(b";LAYER_CHANGE")
+    if b"G9111 " not in data[:first_layer if first_layer > 0 else 2_000_000]:
         raise JobError("Sliced file is missing the Kobra start block (G9111) - wrong profile?")
     segs = plate.segments(data)
     if segs is not None and not plate.fits(segs):
