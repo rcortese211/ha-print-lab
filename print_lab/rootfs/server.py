@@ -26,12 +26,15 @@ import socket
 import subprocess
 import threading
 import time
+
+import numpy as np
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import admin
+import calib
 import mesh
 import plate
 from printer import Printer, PrinterError
@@ -81,6 +84,65 @@ def stage_gcode(name, extra=None):
     STAGED.write_text(json.dumps({**result, **(extra or {}),
                                   "staged_at": time.strftime("%Y-%m-%d %H:%M:%S")}))
     return result
+
+
+CALIBRATION = LAB / "camera_calibration.json"
+CAL_STATE = {"running": False, "last": None}
+
+
+def calibration_run():
+    """Photograph the calibration print every few seconds, then work out the camera."""
+    CAL_STATE.update(running=True, last="waiting for the printer to start printing")
+    run_dir = LAB / "calibration" / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    frames, started, t0 = [], False, time.time()
+    p = printer()
+    try:
+        last_status, state = 0.0, "busy"
+        while time.time() - t0 < 30 * 60:
+            now = time.time()
+            if now - last_status > 10:
+                last_status = now
+                try:
+                    st = p.status()
+                    job = st.get("job") or {}
+                    state = job.get("state") or st.get("state")
+                except PrinterError as err:
+                    print(f"[calibration] status: {err}", flush=True)
+                if not started and state == "printing":
+                    started = True
+                    CAL_STATE["last"] = "photographing"
+                    try:
+                        p.kick_camera()
+                    except PrinterError:
+                        pass
+                if started and state in ("free", "finished", "stoped", "stopped", "idle"):
+                    break
+            if started:
+                f = run_dir / f"{int(now - t0):05d}.jpg"
+                try:
+                    DETECTOR.grab(p.stream_url, f)
+                    frames.append((now - t0, f))
+                except WatchError as err:
+                    print(f"[calibration] frame: {err}", flush=True)
+            time.sleep(4 if started else 5)
+        print(f"[calibration] {len(frames)} frames; solving", flush=True)
+        CAL_STATE["last"] = "solving"
+        cal = calib.solve(frames)
+        CALIBRATION.write_text(json.dumps(cal))
+        overlay = DETECTOR.history / time.strftime("%Y-%m-%d") / f"{time.strftime('%H%M%S')}-0.00-calibration.jpg"
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        if cal.get("P"):
+            calib.draw_overlay(Path(cal["frame"]), np.asarray(cal["P"]), overlay, cal["frame_bed_z"])
+        msg = (f"camera calibrated: {cal['points']} points at bed heights {cal['heights']}, "
+               f"error {cal['rms_px']} px (worst {cal['max_px']})")
+        print(f"[calibration] {msg}", flush=True)
+        CAL_STATE["last"] = msg
+    except Exception as err:  # noqa: BLE001
+        print(f"[calibration] failed: {type(err).__name__}: {err}", flush=True)
+        CAL_STATE["last"] = f"failed: {err}"
+    finally:
+        CAL_STATE["running"] = False
 
 
 def checked(url):
@@ -288,7 +350,10 @@ def slice_job(req):
         base = float((req.get("overrides") or {}).get("retract_length")
                      or profile_value(profile, "retract_length") or 0)
         data, retracts_applied = apply_retracts(data, tune["retracts"], base)
-    if applied or retracts_applied:
+    if tune.get("camera_calibration"):
+        data = calib.postprocess(data)
+        out.write_bytes(data)
+    elif applied or retracts_applied:
         out.write_bytes(data)
     tail = data[-6000:].decode(errors="ignore")
 
@@ -434,6 +499,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self._body(64 * 1024) or b"{}") if method == "POST" else {}
             if method == "GET" and action == "status":
                 return self._send(200, {**printer().status(), "staged": read_staged() or None})
+            if method == "GET" and action == "calibration":
+                _p, cal = calib.load(CALIBRATION)
+                return self._send(200, {**CAL_STATE, "calibration": cal})
             if method == "GET" and action == "files":
                 return self._send(200, {"files": printer().files()})
             if method == "POST" and action == "config":
@@ -454,6 +522,9 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("filename") and body["filename"] != staged["filename"]:
                     raise JobError("That file is not the staged one")
                 result = printer().start(staged, bool(body.get("auto_leveling", True)))
+                if staged["filename"].startswith(calib.NAME) and not CAL_STATE["running"]:
+                    threading.Thread(target=calibration_run, daemon=True).start()
+                    result["calibrating"] = True
                 staged["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 STAGED.write_text(json.dumps(staged))
                 return self._send(200, result)
@@ -492,10 +563,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"error": "forbidden"})
             kept = sorted(DETECTOR.history.glob("*/*.jpg"), reverse=True)[:200] if DETECTOR.history.is_dir() else []
             return self._send(200, {"frames": [f"{p.parent.name}/{p.name}" for p in kept]})
-        m = re.fullmatch(r"/frames/(\d{4}-\d{2}-\d{2})/([0-9]{6}-[0-9.]+(?:-frozen)?\.jpg)", path)
-        if m:
-            if not admin.authorised(self.headers.get("X-Admin-Token")):
-                return self._send(403, {"error": "forbidden"})
+        m = re.fullmatch(r"/frames/(\d{4}-\d{2}-\d{2})/([0-9]{6}-[0-9.]+(?:-frozen|-calibration)?\.jpg)", path)
+        if m:          # single frames are viewable like /watch/last.jpg; the listing needs the token
             f = DETECTOR.history / m.group(1) / m.group(2)
             if f.is_file():
                 return self._send(200, raw=f.read_bytes(), ctype="image/jpeg")
