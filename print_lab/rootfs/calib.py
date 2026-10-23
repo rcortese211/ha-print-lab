@@ -104,7 +104,17 @@ def blobs(g: np.ndarray, max_blobs: int = 60) -> np.ndarray:
     out = []
     for k, sl in enumerate(slices):
         h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
-        if not 4 <= area[k] <= 4000 or area[k] / (h * w) < 0.35 or h > 80 or w > 120:
+        # a flat square seen at an angle: wider than tall, bright, solid
+        if not 20 <= area[k] <= 12000 or area[k] / (h * w) < 0.45 or not 1.2 <= w / h <= 14 or w > 260:
+            continue
+        if ndimage.mean(g, lab, k + 1) < 205:
+            continue
+        # white plastic on the dark bed stands far above its surroundings; glare on the
+        # brighter, glittery near half of the bed doesn't
+        y0, y1 = max(sl[0].start - 2 * h, 0), min(sl[0].stop + 2 * h, g.shape[0])
+        x0, x1 = max(sl[1].start - w, 0), min(sl[1].stop + w, g.shape[1])
+        ring = g[y0:y1, x0:x1][~mask[y0:y1, x0:x1]]
+        if ring.size and ndimage.mean(g, lab, k + 1) - np.median(ring) < 120:
             continue
         out.append((area[k], cx[k], cy[k]))
     out.sort(reverse=True)
@@ -163,121 +173,165 @@ def project(p, world):
     return q[:, :2] / q[:, 2:3]
 
 
+# --------------------------------------------------------------------------- lens
+CENTER = np.array([640.0, 360.0])
+LENS_SCALE = 1000.0
+
+
+def undistort(pts, k1):
+    """Observed pixel -> ideal (pinhole) pixel, one-parameter radial model."""
+    pts = np.asarray(pts, float).reshape(-1, 2)
+    d = pts - CENTER
+    r2 = (d ** 2).sum(1, keepdims=True) / LENS_SCALE ** 2
+    return CENTER + d * (1 + k1 * r2)
+
+
+def distort(pts, k1):
+    """Ideal pixel -> observed pixel (inverse of undistort, by iteration)."""
+    ideal = np.asarray(pts, float).reshape(-1, 2)
+    obs = ideal.copy()
+    for _ in range(8):
+        d = obs - CENTER
+        r2 = (d ** 2).sum(1, keepdims=True) / LENS_SCALE ** 2
+        obs = CENTER + (ideal - CENTER) / (1 + k1 * r2)
+    return obs
+
+
+class Camera:
+    def __init__(self, p, k1=0.0):
+        self.p, self.k1 = np.asarray(p, float), float(k1)
+
+    def project(self, world):
+        return distort(project(self.p, world), self.k1)
+
+    def bed_h(self, zc):
+        """Ideal-pixel homography of the bed plane lowered by zc."""
+        p = self.p
+        return np.c_[p[:, 0], p[:, 1], p[:, 3] - zc * p[:, 2]]
+
+
 # --------------------------------------------------------------------------- matching
-def find_rows(pts: np.ndarray, tol_px: float = 2.5, cr_tol: float = 0.06):
-    """Candidate rows: 4 detections on a line whose cross-ratio matches a marker row."""
-    found = []
-    n = len(pts)
-    for i, j in itertools.combinations(range(n), 2):
-        d = pts[j] - pts[i]
-        length = np.hypot(*d)
-        if length < 20:
-            continue
-        u = d / length
-        nrm = np.array([-u[1], u[0]])
-        off = np.abs((pts - pts[i]) @ nrm)
-        on = np.where(off < tol_px)[0]
-        if len(on) < 4:
-            continue
-        s = (pts[on] - pts[i]) @ u
-        order = on[np.argsort(s)]
-        for quad in itertools.combinations(order, 4):
-            t = (pts[list(quad)] - pts[i]) @ u
-            if np.min(np.diff(t)) < 3:
-                continue
-            cr = cross_ratio(t)
-            for name, want in ROW_CR.items():
-                if abs(cr - want) / want < cr_tol:
-                    found.append((abs(cr - want) / want, name, tuple(quad)))
-    found.sort()
-    best, used = {}, set()
-    for err, name, quad in found:
-        if name in best or used & set(quad):
-            continue
-        best[name] = quad
-        used |= set(quad)
-    return best
+MODEL = np.array([(x, y) for y, xs in ROWS.values() for x in xs], float)
 
 
-def match_frame(pts: np.ndarray):
-    """(bed_xy, image_xy, rms_px) for the markers in one frame, or None (needs 2+ rows)."""
-    rows = find_rows(pts)
-    if len(rows) < 2:
+def _batch_h(src, dst):
+    """Homographies for a batch of 4-point correspondences: (n, 4, 2) -> (n, 3, 3)."""
+    n = len(src)
+    a = np.zeros((n, 8, 9))
+    x, y, u, v = src[..., 0], src[..., 1], dst[..., 0], dst[..., 1]
+    a[:, 0::2, 0], a[:, 0::2, 1], a[:, 0::2, 2] = -x, -y, -1
+    a[:, 0::2, 6], a[:, 0::2, 7], a[:, 0::2, 8] = u * x, u * y, u
+    a[:, 1::2, 3], a[:, 1::2, 4], a[:, 1::2, 5] = -x, -y, -1
+    a[:, 1::2, 6], a[:, 1::2, 7], a[:, 1::2, 8] = v * x, v * y, v
+    _, _, vt = np.linalg.svd(a)
+    return vt[:, -1].reshape(n, 3, 3)
+
+
+def _assign(h, pts, radius):
+    """One-to-one marker <-> detection pairs within radius for homography h."""
+    with np.errstate(all="ignore"):
+        proj = apply_h(h, MODEL)
+    d = np.linalg.norm(proj[:, None, :] - pts[None, :, :], axis=-1)
+    pairs, used_m, used_d = [], set(), set()
+    for flat in np.argsort(d, axis=None):
+        m, k = divmod(int(flat), len(pts))
+        if d[m, k] > radius:
+            break
+        if m in used_m or k in used_d:
+            continue
+        used_m.add(m)
+        used_d.add(k)
+        pairs.append((m, k))
+    return pairs
+
+
+def match_frame(pts: np.ndarray, samples: int = 150_000, seed: int = 0, prior=None):
+    """(bed_xy, image_xy, rms_px) for the markers in one frame, or None (needs 6+).
+    Robust search: random 4-marker/4-detection hypotheses, scored by how many distinct
+    markers land on a detection; then refined on all matches. With a prior homography
+    (from another frame) it only refines."""
+    if len(pts) < 6:
         return None
-    best = None
-    for direction in (1, -1):          # which way bed X runs along the rows in the image
-        bed, img = [], []
-        for name, quad in rows.items():
-            y, xs = ROWS[name]
-            # order the four detections along their line, then pair with the row's Xs
-            q = np.asarray(quad)
-            ref = pts[q[0]]
-            u = pts[q[-1]] - ref
-            s = (pts[q] - ref) @ u
-            ordered = q[np.argsort(s)][::direction]
-            for x, k in zip(xs, ordered):
-                bed.append((x, y))
-                img.append(pts[k])
-        bed, img = np.asarray(bed), np.asarray(img)
-        h = homography(bed, img)
-        rms = float(np.sqrt(((apply_h(h, bed) - img) ** 2).sum(1).mean()))
-        if best is None or rms < best[2]:
-            best = (bed, img, rms)
-    return best if best[2] < 4.0 else None
+    if prior is not None:
+        h = prior
+    else:
+        rng = np.random.default_rng(seed)
+        di = np.argsort(rng.random((samples, len(pts))), axis=1)[:, :4]
+        mi = np.argsort(rng.random((samples, len(MODEL))), axis=1)[:, :4]
+        hs = _batch_h(MODEL[mi], pts[di])
+        with np.errstate(all="ignore"):
+            proj = np.einsum("nij,mj->nmi", hs, np.c_[MODEL, np.ones(len(MODEL))])
+            proj = proj[..., :2] / proj[..., 2:3]
+            d = np.linalg.norm(proj[:, :, None, :] - pts[None, None, :, :], axis=-1)
+        near, ok = d.argmin(-1), d.min(-1) < 8
+        # distinct detections hit by the 12 markers
+        hit = np.zeros((samples, len(pts)), bool)
+        rows = np.repeat(np.arange(samples), len(MODEL))
+        hit[rows[ok.ravel()], near.ravel()[ok.ravel()]] = True
+        score = hit.sum(1)
+        h = hs[int(np.argmax(score))]
+    for radius in (20, 12, 8):
+        pairs = _assign(h, pts, radius)
+        if len(pairs) < 6:
+            return None
+        h = homography(MODEL[[m for m, _ in pairs]], pts[[k for _, k in pairs]])
+    bed, img = MODEL[[m for m, _ in pairs]], pts[[k for _, k in pairs]]
+    rms = float(np.sqrt(((apply_h(h, bed) - img) ** 2).sum(1).mean()))
+    return (bed, img, rms, h) if rms < 10.0 else None
+
+
+def _same_picture(a, b, tol=3.0):
+    if len(a) < 4 or len(b) < 4 or abs(len(a) - len(b)) > 2:
+        return False
+    d = np.linalg.norm(a[:, None, :] - b[None, :, :], axis=-1).min(1)
+    return float(np.median(d)) < tol
 
 
 def solve(frames: list[tuple[float, Path]]) -> dict:
-    """frames: (time, jpg) taken through the calibration print. Returns the calibration."""
-    seen = []
+    """frames: (time, jpg) taken through the calibration run. Returns the calibration."""
+    # 1) group consecutive frames that show the same blobs (one bed height each)
+    groups = []
     for t, jpg in frames:
         try:
-            m = match_frame(blobs(gray(jpg)))
-        except Exception:  # noqa: BLE001  one bad frame shouldn't sink the run
-            m = None
-        if m is not None:
-            seen.append((t, jpg, m))
-    if not seen:
-        raise ValueError("no frame showed at least two rows of markers")
-    # group consecutive frames where the markers sit still (one bed height each)
-    groups = []
-    for t, jpg, (bed, img, rms) in seen:
-        key = {tuple(b): i for b, i in zip(bed, img)}
-        if groups:
+            pts = blobs(gray(jpg))
+        except Exception:  # noqa: BLE001
+            continue
+        if groups and _same_picture(groups[-1]["pts"][-1], pts):
             g = groups[-1]
-            common = [k for k in key if k in g["pts"]]
-            if len(common) >= 4 and np.mean([np.hypot(*(key[k] - np.median(g["pts"][k], 0)))
-                                             for k in common]) < 3.0:
-                g["t1"] = t
-                for k, v in key.items():
-                    g["pts"].setdefault(k, []).append(v)
-                g["frames"].append(jpg)
-                continue
-        groups.append({"t0": t, "t1": t, "pts": {k: [v] for k, v in key.items()}, "frames": [jpg]})
-    groups = [g for g in groups if len(g["frames"]) >= 2]
+            g["t1"] = t
+            g["pts"].append(pts)
+            g["frames"].append(jpg)
+        else:
+            groups.append({"t0": t, "t1": t, "pts": [pts], "frames": [jpg]})
+    groups = [g for g in groups if len(g["frames"]) >= 2 and len(g["pts"][-1]) >= 6]
+    # 2) find the markers in each held group (search once, then refine across its frames)
+    prior = None
+    for g in groups:
+        rep = g["pts"][len(g["pts"]) // 2]
+        m = match_frame(rep, prior=None) if prior is None else (match_frame(rep, prior=prior) or match_frame(rep))
+        if m is None:
+            g["match"] = None
+            continue
+        prior = m[3]
+        g["match"] = {tuple(b): i for b, i in zip(m[0], m[1])}
+        for pts in g["pts"]:          # average each marker over the group's frames
+            mm = match_frame(pts, prior=m[3])
+            if mm:
+                for b, i in zip(mm[0], mm[1]):
+                    g.setdefault("acc", {}).setdefault(tuple(b), []).append(i)
+    groups = [g for g in groups if g.get("acc")]
     if not groups:
-        raise ValueError("the markers never held still long enough to measure")
-    if len(groups) < 2:
-        # the bed didn't move relative to the camera: only a flat map of the bed is possible
-        g = groups[0]
-        bed = np.asarray(list(g["pts"].keys()))
-        img = np.asarray([np.median(v, 0) for v in g["pts"].values()])
-        h = homography(bed, img)
-        err = np.hypot(*(apply_h(h, bed) - img).T)
-        return {"H": h.tolist(), "P": None, "rms_px": round(float(np.sqrt((err ** 2).mean())), 2),
-                "max_px": round(float(err.max()), 2), "points": len(bed), "heights": [],
-                "made": time.strftime("%Y-%m-%d %H:%M:%S"), "frame": str(g["frames"][-1]),
-                "note": "bed height didn't change in the camera; flat bed map only"}
-    # the holds are the last groups, in order (Z1 60 s, Z12 20 s, Z25 40 s); match groups to
-    # holds keeping their order, preferring more matches and hold times that agree
+        raise ValueError("couldn't find the marker squares in any held view")
     for g in groups:
         g["dur"] = g["t1"] - g["t0"] + 4.0
+    # 3) the holds are the last groups, in order (Z1 60 s, Z12 20 s, Z25 40 s)
     tail = groups[-5:]
     best = None
-    for k in range(min(len(tail), len(DWELLS)), 1, -1):
+    for k in range(min(len(tail), len(DWELLS)), 0, -1):
         for gi in itertools.combinations(range(len(tail)), k):
             for di in itertools.combinations(range(len(DWELLS)), k):
                 cost = sum(abs(tail[g]["dur"] - DWELLS[d][1]) / DWELLS[d][1] for g, d in zip(gi, di))
-                cost += 0.5 * (len(tail) - 1 - gi[-1])      # the holds come last
+                cost += 0.5 * (len(tail) - 1 - gi[-1])
                 if best is None or cost < best[0]:
                     best = (cost, [(DWELLS[d][0], tail[g]) for g, d in zip(gi, di)])
         if best is not None and best[0] < 0.6 * k:
@@ -285,26 +339,47 @@ def solve(frames: list[tuple[float, Path]]) -> dict:
     assigned = best[1]
     world, image = [], []
     for z, g in assigned:
-        for (x, y), vs in g["pts"].items():
+        for (x, y), vs in g["acc"].items():
             world.append((x, y, LAYER - z))
             image.append(np.median(vs, 0))
-    p = projection(world, image)
-    err = np.sqrt(((project(p, world) - np.asarray(image)) ** 2).sum(1))
-    return {"P": p.tolist(), "rms_px": round(float(np.sqrt((err ** 2).mean())), 2),
-            "max_px": round(float(err.max()), 2), "points": len(world),
-            "heights": sorted(z for z, _g in assigned), "made": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "frame": str(assigned[0][1]["frames"][-1]), "frame_bed_z": assigned[0][0]}
+    world, image = np.asarray(world), np.asarray(image)
+    info = {"made": time.strftime("%Y-%m-%d %H:%M:%S"), "points": len(world),
+            "heights": sorted(z for z, _g in assigned), "frame": str(assigned[0][1]["frames"][-1]),
+            "frame_bed_z": assigned[0][0], "groups": [round(g["dur"]) for g in groups]}
+    if len({z for z, _g in assigned}) < 2:
+        # one bed height: a flat map of the bed is all that can be had
+        g = assigned[0][1]
+        bed = np.asarray(list(g["acc"].keys()))
+        img = np.asarray([np.median(v, 0) for v in g["acc"].values()])
+        h = homography(bed, img)
+        err = np.hypot(*(apply_h(h, bed) - img).T)
+        return {**info, "H": h.tolist(), "P": None, "k1": 0.0,
+                "rms_px": round(float(np.sqrt((err ** 2).mean())), 2), "max_px": round(float(err.max()), 2),
+                "note": "bed height didn't change in the camera; flat bed map only"}
+    # 4) camera matrix, with the lens bend that fits best
+    best = None
+    for k1 in np.linspace(-0.6, 0.6, 61):
+        ideal = undistort(image, k1)
+        p = projection(world, ideal)
+        err = np.linalg.norm(distort(project(p, world), k1) - image, axis=1)
+        rms = float(np.sqrt((err ** 2).mean()))
+        if best is None or rms < best[0]:
+            best = (rms, k1, p, err)
+    rms, k1, p, err = best
+    return {**info, "P": p.tolist(), "k1": round(float(k1), 4), "rms_px": round(rms, 2),
+            "max_px": round(float(err.max()), 2)}
 
 
 def load(path: Path):
+    """(Camera or None, calibration dict or None)."""
     try:
         cal = json.loads(path.read_text())
-        return (np.asarray(cal["P"]) if cal.get("P") else None), cal
+        return (Camera(cal["P"], cal.get("k1", 0.0)) if cal.get("P") else None), cal
     except (OSError, ValueError, KeyError):
         return None, None
 
 
-def draw_overlay(jpg: Path, p, out: Path, bed_z: float = DWELLS[0][0]) -> None:
+def draw_overlay(jpg: Path, cam, out: Path, bed_z: float = DWELLS[0][0]) -> None:
     """The frame with the bed outline and marker centres drawn where the calibration puts them."""
     g = gray(jpg)
     h, w = g.shape
@@ -318,11 +393,11 @@ def draw_overlay(jpg: Path, p, out: Path, bed_z: float = DWELLS[0][0]) -> None:
 
     edge = np.concatenate([np.c_[np.linspace(0, 250, 200), np.full(200, y)] for y in (0, 250)] +
                           [np.c_[np.full(200, x), np.linspace(0, 250, 200)] for x in (0, 250)])
-    for u, v in project(p, np.c_[edge, np.full(len(edge), -bed_z)]):
+    for u, v in cam.project(np.c_[edge, np.full(len(edge), -bed_z)]):
         dot(u, v, (0, 200, 255), 1)
     for y, xs in ROWS.values():
         for x in xs:
-            u, v = project(p, [(x, y, LAYER - bed_z)])[0]
+            u, v = cam.project([(x, y, LAYER - bed_z)])[0]
             dot(u, v, (255, 40, 40), 4)
     subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", f"{w}x{h}", "-i", "-", "-q:v", "3", str(out)], input=img.tobytes(), check=True)

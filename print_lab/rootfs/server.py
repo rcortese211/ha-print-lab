@@ -98,13 +98,16 @@ def calibration_run():
     CAL_STATE.update(running=True, last="waiting for the printer to start printing")
     run_dir = LAB / "calibration" / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    frames, started, t0 = [], False, time.time()
+    frames, started, t0 = [], None, time.time()
     p = printer()
+    # the printer reports idle as soon as it has read the file, while it is still holding the
+    # bed at each height, so photograph for a fixed time once printing starts
+    shoot_for = 60 + sum(secs for _z, secs in calib.DWELLS) + 90
     try:
         last_status, state = 0.0, "busy"
         while time.time() - t0 < 30 * 60:
             now = time.time()
-            if now - last_status > 10:
+            if started is None and now - last_status > 5:
                 last_status = now
                 try:
                     st = p.status()
@@ -112,23 +115,23 @@ def calibration_run():
                     state = job.get("state") or st.get("state")
                 except PrinterError as err:
                     print(f"[calibration] status: {err}", flush=True)
-                if not started and state == "printing":
-                    started = True
+                if state == "printing":
+                    started = now
                     CAL_STATE["last"] = "photographing"
                     try:
                         p.kick_camera()
                     except PrinterError:
                         pass
-                if started and state in ("free", "finished", "stoped", "stopped", "idle"):
-                    break
-            if started:
+            if started is not None and now - started > shoot_for:
+                break
+            if started is not None:
                 f = run_dir / f"{int(now - t0):05d}.jpg"
                 try:
                     DETECTOR.grab(p.stream_url, f)
                     frames.append((now - t0, f))
                 except WatchError as err:
                     print(f"[calibration] frame: {err}", flush=True)
-            time.sleep(4 if started else 5)
+            time.sleep(3 if started is not None else 2)
         print(f"[calibration] {len(frames)} frames; solving", flush=True)
         CAL_STATE["last"] = "solving"
         cal = calib.solve(frames)
@@ -136,9 +139,11 @@ def calibration_run():
         overlay = DETECTOR.history / time.strftime("%Y-%m-%d") / f"{time.strftime('%H%M%S')}-0.00-calibration.jpg"
         overlay.parent.mkdir(parents=True, exist_ok=True)
         if cal.get("P"):
-            calib.draw_overlay(Path(cal["frame"]), np.asarray(cal["P"]), overlay, cal["frame_bed_z"])
+            calib.draw_overlay(Path(cal["frame"]), calib.Camera(cal["P"], cal.get("k1", 0.0)), overlay,
+                               cal["frame_bed_z"])
         msg = (f"camera calibrated: {cal['points']} points at bed heights {cal['heights']}, "
-               f"error {cal['rms_px']} px (worst {cal['max_px']})")
+               f"error {cal['rms_px']} px (worst {cal['max_px']}), lens k1 {cal.get('k1')}, "
+               f"held views {cal.get('groups')}")
         print(f"[calibration] {msg}", flush=True)
         CAL_STATE["last"] = msg
     except Exception as err:  # noqa: BLE001

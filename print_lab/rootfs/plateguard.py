@@ -32,8 +32,8 @@ SCORE_SPAN = 1000       # ... and px more for a full 1.0
 class Plan:
     """What the current layer of the current job should look like from the camera."""
 
-    def __init__(self, p, segs, zc, shape):
-        self.p, self.zc = p, zc
+    def __init__(self, cam, segs, zc, shape):
+        self.cam, self.zc = cam, zc
         h, w = shape
         x0, y0, x1, y1, z = segs
         done = z <= zc + 1e-3
@@ -48,7 +48,7 @@ class Plan:
         if len(xs) > 400_000:
             keep = np.linspace(0, len(xs) - 1, 400_000).astype(int)
             xs, ys, zs = xs[keep], ys[keep], zs[keep]
-        uv = calib.project(p, np.c_[xs, ys, zs])
+        uv = cam.project(np.c_[xs, ys, zs])
         self.expected = _mask_from(uv, shape, grow=7)
         # the parts proper (above the skirt and first layers): what disappears when one is knocked off
         high = (zs + zc) >= 1.5
@@ -61,10 +61,10 @@ class Plan:
         bx = (lx.min() - HEAD_XY, lx.max() + HEAD_XY)
         by = (ly.min() - HEAD_XY, ly.max() + HEAD_XY)
         corners = np.array([[x, y, zz] for x in bx for y in by for zz in (0.0, HEAD_UP)])
-        self.head = _hull_mask(calib.project(p, corners), shape)
+        self.head = _hull_mask(cam.project(corners), shape)
         # the bed itself, where it is now
         bed = np.array([[0, 0, -zc], [250, 0, -zc], [250, 250, -zc], [0, 250, -zc]], float)
-        self.bed = _hull_mask(calib.project(p, bed), shape)
+        self.bed = _hull_mask(cam.project(bed), shape)
         # crop for the model: around where the parts are, with room for a mess, never tiny
         ys_, xs_ = np.nonzero(self.expected)
         self.crop = None
@@ -77,9 +77,8 @@ class Plan:
             self.crop = (round(x_a / w, 3), round(y_a / h, 3), round((x_b - x_a) / w, 3), round((y_b - y_a) / h, 3))
 
     def bed_h(self, zc=None):
-        """Homography: bed mm (x, y) -> pixel, with the bed lowered to zc."""
-        p, zc = self.p, self.zc if zc is None else zc
-        return np.c_[p[:, 0], p[:, 1], p[:, 3] - zc * p[:, 2]]
+        """Homography: bed mm (x, y) -> ideal (undistorted) pixel, bed lowered to zc."""
+        return self.cam.bed_h(self.zc if zc is None else zc)
 
 
 def _mask_from(uv, shape, grow):
@@ -137,10 +136,10 @@ class PlateGuard:
 
     def plan(self, status: dict | None, shape=(720, 1280)):
         """A Plan for the current layer, or None (no calibration, not printing, unknown file)."""
-        p, _cal = calib.load(self.cal_path)
+        cam, _cal = calib.load(self.cal_path)
         job = (status or {}).get("job") or {}
         name = str(job.get("filename") or "")
-        if p is None or not name.endswith(".gcode") or job.get("state") not in ("printing", "resumed"):
+        if cam is None or not name.endswith(".gcode") or job.get("state") not in ("printing", "resumed"):
             if not job:
                 self.reset()
             return None
@@ -158,7 +157,7 @@ class PlateGuard:
             return None
         layer = int(job.get("curr_layer") or 1)
         zc = self.layer_z[min(max(layer, 1), len(self.layer_z)) - 1]
-        plan = Plan(p, self.segs, zc, shape)
+        plan = Plan(cam, self.segs, zc, shape)
         plan.layer = layer
         return plan
 
@@ -206,8 +205,10 @@ class PlateGuard:
         to_ref = h_ref @ np.linalg.inv(h_now)
         hh, ww = g.shape
         yy, xx = np.mgrid[0:hh, 0:ww]
-        q = np.stack([xx.ravel(), yy.ravel(), np.ones(xx.size)]).T @ to_ref.T
-        u, v = q[:, 0] / q[:, 2], q[:, 1] / q[:, 2]
+        ideal = calib.undistort(np.c_[xx.ravel(), yy.ravel()], plan.cam.k1)
+        q = np.c_[ideal, np.ones(len(ideal))] @ to_ref.T
+        obs = calib.distort(q[:, :2] / q[:, 2:3], plan.cam.k1)
+        u, v = obs[:, 0], obs[:, 1]
         warped = ndimage.map_coordinates(ref_g, [v, u], order=1, cval=np.nan).reshape(g.shape)
         ref_head_now = ndimage.map_coordinates(ref_head.astype(np.float32), [v, u], order=0,
                                                cval=0).reshape(g.shape) > 0.5
