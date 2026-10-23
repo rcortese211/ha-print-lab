@@ -100,11 +100,14 @@ def set_bot(lab: Path, cfg: dict) -> dict:
         raise ValueError("telegram_token doesn't look like a BotFather token")
     if not chats or not all(isinstance(c, int) and not isinstance(c, bool) for c in chats):
         raise ValueError("chat_ids must be a non-empty list of numbers")
+    tv = str(cfg.get("thingiverse_token", ""))
+    if tv and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", tv):
+        raise ValueError("thingiverse_token doesn't look like a Thingiverse app token")
     dest = lab / "bot.json"
     tmp = lab / "bot.json.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump({"telegram_token": tg, "chat_ids": chats}, f)
+        json.dump({"telegram_token": tg, "chat_ids": chats, **({"thingiverse_token": tv} if tv else {})}, f)
     os.replace(tmp, dest)
     return {"ok": True, "chat_ids": len(chats)}
 

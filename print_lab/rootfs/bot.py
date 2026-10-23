@@ -200,6 +200,7 @@ class Bot:
         self.tg = Telegram(cfg["telegram_token"])
         self.lab = Lab()
         self.chats = {int(c) for c in cfg["chat_ids"]}
+        sources.THINGIVERSE_TOKEN = str(cfg.get("thingiverse_token", ""))
         self.pending = {}          # chat -> (action, arg, since)
         self.job = None            # thread doing a slice/stage
 

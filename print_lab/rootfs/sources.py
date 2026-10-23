@@ -117,8 +117,41 @@ def _printables(model_id: str) -> tuple[str, list[Candidate]]:
     return model.get("name") or f"Printables {model_id}", files
 
 
+THINGIVERSE_TOKEN = os.environ.get("THINGIVERSE_TOKEN", "")   # set by the bot from its config
+
+
 def _thingiverse(thing_id: str) -> tuple[str, list[Candidate]]:
+    """Thingiverse through its official API with the owner's app token; without one, the
+    thing's download-all zip (which Thingiverse doesn't always hand to scripts)."""
+    if THINGIVERSE_TOKEN:
+        auth = {"Authorization": f"Bearer {THINGIVERSE_TOKEN}"}
+        try:
+            thing = json.loads(_request(f"https://api.thingiverse.com/things/{thing_id}", headers=auth,
+                                        timeout=30, limit=5_000_000))
+            files = json.loads(_request(f"https://api.thingiverse.com/things/{thing_id}/files", headers=auth,
+                                        timeout=30, limit=5_000_000))
+        except ValueError as err:
+            raise SourceError("Thingiverse's API answered with something unreadable") from err
+        if not isinstance(files, list):
+            raise SourceError(f"Thingiverse's API said: {str(files)[:120]}")
+
+        def getter(f):
+            def get():
+                url = f.get("download_url") or f.get("direct_url") or f.get("public_url")
+                if not url:
+                    raise SourceError(f"Thingiverse gave no link for {f.get('name')}")
+                return _request(url, headers=auth if "api.thingiverse.com" in url else None)
+            return get
+
+        title = thing.get("name") if isinstance(thing, dict) else None
+        return title or f"Thingiverse {thing_id}", [
+            Candidate(f["name"], f.get("size"), getter(f)) for f in files
+            if str(f.get("name", "")).lower().endswith(MODEL_EXT)]
     blob = _request(f"https://www.thingiverse.com/thing:{thing_id}/zip")
+    if blob[:2] != b"PK":
+        print(f"[sources] thingiverse {thing_id}/zip gave {len(blob)} bytes: {blob[:80]!r}", flush=True)
+        raise SourceError("Thingiverse didn't hand over a zip. Give the bot a Thingiverse app token "
+                          "(free, thingiverse.com/developers) and it'll use their API instead")
     return f"Thingiverse {thing_id}", _zip_candidates(blob)
 
 
