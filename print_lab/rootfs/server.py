@@ -590,7 +590,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self._body(64 * 1024) or b"{}") if method == "POST" else {}
             if method == "GET" and action == "status":
-                return self._send(200, {**printer().status(), "staged": read_staged() or None})
+                return self._send(200, {**printer().status(), "camera": printer().stream_url,
+                                        "staged": read_staged() or None})
             if method == "GET" and action == "calibration":
                 _p, cal = calib.load(CALIBRATION)
                 return self._send(200, {**CAL_STATE, "calibration": cal})
