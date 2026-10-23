@@ -54,6 +54,8 @@ HELP = (
     "/files - files Print Lab has\n"
     "/print <name> - put a Print Lab file on the printer\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
+    "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
+    "/print hook x3, clip x5 - same with models Print Lab already has\n"
     "/pause  /resume  /stop\n"
     "Nothing starts or stops until you reply yes."
 )
@@ -113,12 +115,13 @@ class Telegram:
             self.api("sendMessage", {"chat_id": chat, "text": text[i:i + 4000],
                                      "disable_web_page_preview": True})
 
-    def photo(self, chat, jpg, caption=""):
+    def photo(self, chat, jpg, caption="", png=False):
         b = uuid.uuid4().hex
+        name, ctype = ("plate.png", "image/png") if png else ("printer.jpg", "image/jpeg")
         head = (f'--{b}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat}\r\n'
                 f'--{b}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption[:1000]}\r\n'
-                f'--{b}\r\nContent-Disposition: form-data; name="photo"; filename="printer.jpg"\r\n'
-                f'Content-Type: image/jpeg\r\n\r\n').encode()
+                f'--{b}\r\nContent-Disposition: form-data; name="photo"; filename="{name}"\r\n'
+                f'Content-Type: {ctype}\r\n\r\n').encode()
         http("POST", self.base + "sendPhoto", head + jpg + f"\r\n--{b}--\r\n".encode(),
              {"Content-Type": f"multipart/form-data; boundary={b}"}, timeout=60)
 
@@ -145,6 +148,47 @@ def duration(minutes):
     except (TypeError, ValueError):
         return None
     return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+COUNT_BEFORE = re.compile(r"(\d{1,2})\s*[x×*]\s*$", re.I)
+COUNT_AFTER = re.compile(r"^\s*[x×*]\s*(\d{1,2})\b", re.I)
+ENTRY_RE = re.compile(r"^(?:(\d{1,2})\s*[x×*]\s*)?(.+?)(?:\s*[x×*]\s*(\d{1,2}))?$", re.I)
+
+
+def parse_links(text):
+    """[(url, count)] from a message; a count goes before or after its link: "3x URL", "URL x3"."""
+    items = []
+    for m in LINK_RE.finditer(text):
+        url = m.group(0).rstrip(".,;)")
+        before = text[:m.start()].split("\n")[-1]
+        after = text[m.end():].split("\n")[0]
+        c = COUNT_AFTER.match(after) or COUNT_BEFORE.search(before)
+        items.append((url, max(1, int(c.group(1))) if c else 1))
+    return items
+
+
+def parse_entries(text):
+    """[(name, count)] from "/print hook x3, clip x5"."""
+    out = []
+    for part in re.split(r"[,\n]+", text):
+        part = part.strip()
+        if not part:
+            continue
+        m = ENTRY_RE.match(part)
+        count = int(m.group(1) or m.group(3) or 1)
+        out.append((m.group(2).strip(), max(1, count)))
+    return out
+
+
+def plate_name(labels):
+    """A file name for a plate: hook_x3_clip_x5 (or just the model's name for one piece)."""
+    if len(labels) == 1 and labels[0][1] == 1:
+        return safe_name(labels[0][0])
+    return safe_name("_".join(f"{n}_x{c}" if c > 1 else n for n, c in labels))
+
+
+def describe(labels):
+    return ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in labels)
 
 
 def find_model_link(url):
@@ -204,7 +248,7 @@ class Bot:
             elif word in QUALITY:
                 self.choose_quality(chat, word)
             elif LINK_RE.search(text):
-                self.background(chat, self.stage_link, LINK_RE.search(text).group(0))
+                self.background(chat, self.stage_links, parse_links(text))
             else:
                 self.tg.send(chat, "Not sure what you mean. /help lists what I can do.")
         except Err as err:
@@ -319,74 +363,109 @@ class Bot:
         out.append("\n/print <name> to put one on the printer.")
         self.tg.send(chat, "\n".join(out))
 
-    def stage_name(self, chat, name):
-        base = re.sub(r"\.(gcode|stl|3mf|obj|step|stp|scad)$", "", name.strip(), flags=re.I)
+    def stage_name(self, chat, text):
+        """/print: one sliced file goes straight on the printer; models (any count) get sliced."""
+        entries = parse_entries(text)
         f = self.lab_files()
         gcode = {g["name"][:-6].lower(): g["name"] for g in f["gcode"]}
         models = {m["name"].lower(): m["name"] for m in f["models"]}
-        model_by_base = {}
         for m in f["models"]:
-            model_by_base.setdefault(m["name"].rsplit(".", 1)[0].lower(), m["name"])
-        key = base.lower()
-        if key in gcode:
-            self.tg.send(chat, f"Putting {gcode[key]} on the printer...")
-            r = self.lab.post("/printer/stage", {"gcode": gcode[key]}, timeout=600) or {}
-            details = r.get("printer_details") or {}
-            est = duration(details["estimated_time_s"] / 60) if details.get("estimated_time_s") else None
-            self.ready(chat, r.get("filename", gcode[key]), est, None)
-        elif name.lower() in models or key in model_by_base:
-            model = models.get(name.lower()) or model_by_base[key]
-            self.tg.send(chat, f"Slicing {model} (a few minutes)...")
-            r = self.lab.post("/slice", {"name": safe_name(base), "model": model, "stage": True},
-                              timeout=1800) or {}
-            s = r.get("sliced") or {}
-            self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"), s.get("filament_g"))
-        else:
-            near = [n for n in list(gcode.values()) + list(models.values()) if key in n.lower()][:8]
-            self.tg.send(chat, f"Print Lab has nothing called {name}."
+            models.setdefault(m["name"].rsplit(".", 1)[0].lower(), m["name"])
+        if len(entries) == 1 and entries[0][1] == 1:
+            key = re.sub(r"\.gcode$", "", entries[0][0], flags=re.I).lower()
+            if key in gcode:
+                self.tg.send(chat, f"Putting {gcode[key]} on the printer...")
+                r = self.lab.post("/printer/stage", {"gcode": gcode[key]}, timeout=600) or {}
+                details = r.get("printer_details") or {}
+                est = duration(details["estimated_time_s"] / 60) if details.get("estimated_time_s") else None
+                self.ready(chat, r.get("filename", gcode[key]), est, None)
+                return
+        items, labels, missing = [], [], []
+        for name, count in entries:
+            key = name.lower()
+            model = models.get(key) or models.get(re.sub(r"\.(stl|3mf|obj|step|stp|scad)$", "", key))
+            if not model:
+                missing.append(name + (" (only sliced G-code, which can't share a plate)"
+                                       if key.removesuffix(".gcode") in gcode else ""))
+                continue
+            items.append({"model": model, "count": count})
+            labels.append((model.rsplit(".", 1)[0], count))
+        if missing:
+            near = [n for n in models.values() if any(m.split()[0].lower() in n.lower() for m in missing)][:8]
+            self.tg.send(chat, "Print Lab doesn't have: " + "; ".join(missing)
                          + ("\nClose matches:\n  " + "\n  ".join(near) if near else "\nSee /files."))
-
-    def stage_link(self, chat, url):
-        self.tg.send(chat, "Looking at that link...")
-        file_url = find_model_link(url)
-        if not file_url:
-            self.tg.send(chat, "I couldn't find a model file behind that link. Send the direct download "
-                               "link to the STL/3MF (on Printables or Thingiverse: right-click the file's "
-                               "download button and copy the link).")
             return
-        stem = os.path.basename(urllib.parse.urlsplit(file_url).path).rsplit(".", 1)[0]
-        name = safe_name(urllib.parse.unquote(stem))
-        self.pending[chat] = ("quality", (file_url, name), time.time())
-        self.tg.buttons(chat, f"Found {os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(file_url).path))}. "
-                              "How should I print it?",
+        self.ask_quality(chat, items, labels)
+
+    def stage_links(self, chat, links):
+        self.tg.send(chat, "Looking at that link..." if len(links) == 1 else f"Looking at {len(links)} links...")
+        items, labels, bad = [], [], []
+        for url, count in links:
+            file_url = find_model_link(url)
+            if not file_url:
+                bad.append(url)
+                continue
+            fname = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(file_url).path))
+            items.append({"url": file_url, "count": count})
+            labels.append((fname.rsplit(".", 1)[0], count))
+        if bad:
+            self.tg.send(chat, "I couldn't find a model file behind:\n" + "\n".join(bad) + "\nSend the direct "
+                               "download link to the STL/3MF (on Printables or Thingiverse: right-click the "
+                               "file's download button and copy the link).")
+            return
+        self.ask_quality(chat, items, labels)
+
+    def ask_quality(self, chat, items, labels):
+        self.pending[chat] = ("quality", (items, labels), time.time())
+        what = describe(labels)
+        pieces = sum(c for _, c in labels)
+        self.tg.buttons(chat, f"{what}" + (f" ({pieces} pieces on one plate)" if pieces > 1 else "")
+                        + ". How should I print " + ("them?" if pieces > 1 else "it?"),
                         [[(QUALITY[k][0], f"q:{k}") for k in ("fast", "medium", "high")]])
 
     def choose_quality(self, chat, key):
         action, arg, since = self.pending.get(chat, (None, None, 0))
         if action != "quality" or time.time() - since > CONFIRM_FOR:
-            self.tg.send(chat, "Send me a link first.")
+            self.tg.send(chat, "Send me a link (or /print a model) first.")
             return
         del self.pending[chat]
-        self.background(chat, self.slice_link, (arg[0], arg[1], key))
+        self.background(chat, self.slice_plate, (arg[0], arg[1], key))
 
-    def slice_link(self, chat, job):
-        file_url, name, key = job
+    def slice_plate(self, chat, job):
+        items, labels, key = job
         label, overrides = QUALITY[key]
-        self.tg.send(chat, f"Downloading and slicing {name} ({label}, a few minutes)...")
-        r = self.lab.post("/slice", {"name": name, "url": file_url, "stage": True, "overrides": overrides},
-                          timeout=1800) or {}
+        name = plate_name(labels)
+        self.tg.send(chat, f"Slicing {describe(labels)} ({label}, a few minutes)...")
+        body = {"name": name, "stage": True, "overrides": overrides}
+        if len(items) == 1 and items[0]["count"] == 1:
+            body.update({k: v for k, v in items[0].items() if k != "count"})
+        else:
+            body["models"] = items
+        r = self.lab.post("/slice", body, timeout=1800) or {}
         s = r.get("sliced") or {}
-        self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"), s.get("filament_g"))
+        self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"),
+                   s.get("filament_g"), s.get("preview"), describe(labels))
 
-    def ready(self, chat, filename, est, grams):
+    def ready(self, chat, filename, est, grams, preview=None, what=None):
         if not filename:
             self.tg.send(chat, "It sliced, but nothing got staged on the printer.")
             return
-        bits = [f"{filename} is on the printer."]
+        bits = [f"{what or filename} is on the printer."]
         if est:
             bits.append(f"About {est}" + (f", {grams} g of filament." if grams else "."))
         bits.append("Bed clear? Reply yes to start, no to leave it.")
-        self.ask(chat, "start", filename, "\n".join(bits))
+        text = "\n".join(bits)
+        self.pending[chat] = ("start", filename, time.time())
+        png = None
+        if preview:
+            try:
+                png = self.lab.get(preview, timeout=60, raw=True)
+            except Err as err:
+                log("no preview:", err)
+        if png:
+            self.tg.photo(chat, png, text, png=True)
+        else:
+            self.tg.send(chat, text)
 
     # ------------------------------------------------------------- loop
     def run(self, mtime):

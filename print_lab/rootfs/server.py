@@ -2,7 +2,9 @@
 
 Internal Supervisor network only. Endpoints:
   GET  /health
-  POST /slice            {name, scad|url|model, profile?, overrides?}
+  POST /slice            {name, scad|url|model|models, profile?, overrides?}
+                         models: [{url|model, count}] arranges several models on one plate
+  GET  /preview/<name>.png  top-down picture of a sliced plate
   GET  /gcode/<name>
   GET  /profiles
   GET  /files            models and sliced G-code on the drive, newest first
@@ -29,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import admin
+import plate
 from printer import Printer, PrinterError
 from watch import Detector, WatchError
 
@@ -109,6 +112,26 @@ def version(cmd):
         return f"unavailable ({err})"
 
 
+def model_input(item, fallback_name):
+    """A model file for one plate entry: downloaded, from the models folder, or OpenSCAD."""
+    if item.get("url"):
+        url = str(item["url"])
+        stem = os.path.splitext(os.path.basename(urllib.parse.urlsplit(url).path))[0]
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", urllib.parse.unquote(stem)).strip("_-")[:50] or fallback_name
+        model = fetch(url, stem)
+    elif item.get("model"):
+        model = MODELS / Path(str(item["model"])).name
+        if not model.is_file():
+            raise JobError(f"{model.name} is not in printlab/models")
+    else:
+        raise JobError("Each model needs a url or a model name")
+    if model.suffix == ".scad":
+        stl = WORK / f"{model.stem}.stl"
+        run(["openscad", "-o", str(stl), str(model)], timeout=600)
+        model = stl
+    return model
+
+
 def fetch(url, name):
     p = urllib.parse.urlsplit(url)
     if p.scheme not in ("http", "https"):
@@ -136,22 +159,28 @@ def slice_job(req):
     if not NAME_RE.fullmatch(profile) or not (PROFILES / f"{profile}.ini").is_file():
         raise JobError(f"Unknown profile '{profile}'")
 
-    if req.get("scad"):
+    inputs = []
+    if req.get("models"):
+        items = req["models"]
+        if not isinstance(items, list) or not 1 <= len(items) <= 12:
+            raise JobError("models must be a list of 1-12 entries")
+        for i, item in enumerate(items):
+            count = int(item.get("count", 1))
+            if not 1 <= count <= 50:
+                raise JobError("count must be 1-50")
+            inputs += [str(model_input(item, f"{name}_{i + 1}"))] * count
+        if len(inputs) > 100:
+            raise JobError("That's more than 100 pieces on one plate")
+    elif req.get("scad"):
         model = MODELS / f"{name}.scad"
         model.write_text(str(req["scad"]))
+        inputs = [str(model_input({"model": model.name}, name))]
     elif req.get("url"):
-        model = fetch(str(req["url"]), name)
+        inputs = [str(fetch(str(req["url"]), name))]
     elif req.get("model"):
-        model = MODELS / Path(str(req["model"])).name
-        if not model.is_file():
-            raise JobError(f"{model.name} is not in printlab/models")
+        inputs = [str(model_input({"model": req["model"]}, name))]
     else:
-        raise JobError("Give one of: scad, url, model")
-
-    if model.suffix == ".scad":
-        stl = WORK / f"{name}.stl"
-        run(["openscad", "-o", str(stl), str(model)], timeout=600)
-        model = stl
+        raise JobError("Give one of: scad, url, model, models")
 
     args = ["prusa-slicer", "--export-gcode", "--load", str(PROFILES / f"{profile}.ini")]
     # overrides go in a second ini loaded on top of the profile: the CLI can't take on/off
@@ -167,7 +196,8 @@ def slice_job(req):
         extra.write_text("\n".join(lines) + "\n")
         args += ["--load", str(extra)]
     out = GCODE / f"{name}.gcode"
-    args += ["--center", "125,125", "--output", str(out), str(model)]
+    # one piece: centre it; several: let the slicer arrange them (it centres the group)
+    args += (["--merge"] if len(inputs) > 1 else ["--center", "125,125"]) + ["--output", str(out), *inputs]
     try:
         run(args)
     except JobError:
@@ -180,6 +210,12 @@ def slice_job(req):
         out.write_bytes(data)
     if b"G9111 " not in data[:20000]:
         raise JobError("Sliced file is missing the Kobra start block (G9111) - wrong profile?")
+    segs = plate.segments(data)
+    if segs is not None and not plate.fits(segs):
+        lo_x, hi_x, lo_y, hi_y = plate.extents(segs)
+        out.unlink(missing_ok=True)
+        raise JobError(f"It doesn't fit on the bed: that layout needs about {hi_x - lo_x:.0f} x {hi_y - lo_y:.0f} mm "
+                       f"(the bed is 250 x 250). Try fewer copies or split it into two plates.")
     # "tune" carries calibration steps; top-level "temps" is kept for older callers
     tune = dict(req.get("tune") or {})
     if req.get("temps") and "temps" not in tune:
@@ -202,7 +238,8 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"), "profile": profile,
-            "layers": data.count(b";LAYER_CHANGE"), "temps_applied": applied,
+            "layers": data.count(b";LAYER_CHANGE"), "pieces": len(inputs),
+            "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
             "retracts_applied": retracts_applied}
 
 
@@ -396,6 +433,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"models": ls(MODELS, MODEL_EXT), "gcode": ls(GCODE, (".gcode",))})
         if path == "/watch/last.jpg" and (DETECTOR.dir / "last.jpg").is_file():
             return self._send(200, raw=(DETECTOR.dir / "last.jpg").read_bytes(), ctype="image/jpeg")
+        m = re.fullmatch(r"/preview/([A-Za-z0-9_-]{1,60})\.png", path)
+        if m and (GCODE / f"{m.group(1)}.gcode").is_file():
+            src = GCODE / f"{m.group(1)}.gcode"
+            png = WORK / f"{m.group(1)}.preview.png"
+            if not png.is_file() or png.stat().st_mtime < src.stat().st_mtime:
+                segs = plate.segments(src.read_bytes())
+                if segs is None:
+                    return self._send(404, {"error": "nothing to draw"})
+                png.write_bytes(plate.render(segs))
+            return self._send(200, raw=png.read_bytes(), ctype="image/png")
         m = re.fullmatch(r"/gcode/([A-Za-z0-9_-]{1,60}\.gcode)", path)
         if m and (GCODE / m.group(1)).is_file():
             return self._send(200, raw=(GCODE / m.group(1)).read_bytes(), ctype="text/plain")
