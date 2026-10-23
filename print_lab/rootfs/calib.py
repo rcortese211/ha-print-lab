@@ -33,6 +33,7 @@ SQUARE = 9.0                    # mm
 LAYER = 0.3                     # mm (the profile's first layer)
 DWELLS = ((1.0, 60), (12.0, 20), (25.0, 40))   # (bed Z mm, seconds held) after the layer
 NAME = "camera_calibration"
+VERSION = 3                     # bump to re-solve the last run with new code on restart
 
 
 def cross_ratio(t):
@@ -303,6 +304,8 @@ def solve(frames: list[tuple[float, Path]]) -> dict:
             g["frames"].append(jpg)
         else:
             groups.append({"t0": t, "t1": t, "pts": [pts], "frames": [jpg]})
+    detail = [{"t": round(g["t0"]), "dur": round(g["t1"] - g["t0"]), "frames": len(g["frames"]),
+               "blobs": len(g["pts"][-1])} for g in groups]
     groups = [g for g in groups if len(g["frames"]) >= 2 and len(g["pts"][-1]) >= 6]
     # 2) find the markers in each held group (search once, then refine across its frames)
     prior = None
@@ -321,7 +324,7 @@ def solve(frames: list[tuple[float, Path]]) -> dict:
                     g.setdefault("acc", {}).setdefault(tuple(b), []).append(i)
     groups = [g for g in groups if g.get("acc")]
     if not groups:
-        raise ValueError("couldn't find the marker squares in any held view")
+        raise ValueError(f"couldn't find the marker squares in any held view; views: {detail}")
     for g in groups:
         g["dur"] = g["t1"] - g["t0"] + 4.0
     # 3) the holds are the last groups, in order (Z1 60 s, Z12 20 s, Z25 40 s)
@@ -345,7 +348,11 @@ def solve(frames: list[tuple[float, Path]]) -> dict:
     world, image = np.asarray(world), np.asarray(image)
     info = {"made": time.strftime("%Y-%m-%d %H:%M:%S"), "points": len(world),
             "heights": sorted(z for z, _g in assigned), "frame": str(assigned[0][1]["frames"][-1]),
-            "frame_bed_z": assigned[0][0], "groups": [round(g["dur"]) for g in groups]}
+            "frame_bed_z": assigned[0][0], "groups": [round(g["dur"]) for g in groups],
+            "views": detail, "version": VERSION,
+            "matched": [{"t": round(g["t0"]), "markers": len(g["acc"]),
+                         "centre": [round(float(v), 1) for v in np.mean([np.median(x, 0) for x in g["acc"].values()], 0)]}
+                        for g in groups]}
     if len({z for z, _g in assigned}) < 2:
         # one bed height: a flat map of the bed is all that can be had
         g = assigned[0][1]
@@ -401,3 +408,15 @@ def draw_overlay(jpg: Path, cam, out: Path, bed_z: float = DWELLS[0][0]) -> None
             dot(u, v, (255, 40, 40), 4)
     subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", f"{w}x{h}", "-i", "-", "-q:v", "3", str(out)], input=img.tobytes(), check=True)
+
+
+def contact_sheet(frames: list[Path], out: Path) -> None:
+    """All frames of a run, small, in time order (4 across)."""
+    if not frames:
+        return
+    lst = out.with_suffix(".txt")
+    lst.write_text("".join(f"file '{f}'\n" for f in frames))
+    rows = (len(frames) + 3) // 4
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+                    "-vf", f"scale=320:180,tile=4x{rows}", "-frames:v", "1", "-q:v", "4", str(out)],
+                   capture_output=True, timeout=120)

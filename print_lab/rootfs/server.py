@@ -132,25 +132,56 @@ def calibration_run():
                 except WatchError as err:
                     print(f"[calibration] frame: {err}", flush=True)
             time.sleep(3 if started is not None else 2)
-        print(f"[calibration] {len(frames)} frames; solving", flush=True)
-        CAL_STATE["last"] = "solving"
-        cal = calib.solve(frames)
-        CALIBRATION.write_text(json.dumps(cal))
-        overlay = DETECTOR.history / time.strftime("%Y-%m-%d") / f"{time.strftime('%H%M%S')}-0.00-calibration.jpg"
-        overlay.parent.mkdir(parents=True, exist_ok=True)
-        if cal.get("P"):
-            calib.draw_overlay(Path(cal["frame"]), calib.Camera(cal["P"], cal.get("k1", 0.0)), overlay,
-                               cal["frame_bed_z"])
-        msg = (f"camera calibrated: {cal['points']} points at bed heights {cal['heights']}, "
-               f"error {cal['rms_px']} px (worst {cal['max_px']}), lens k1 {cal.get('k1')}, "
-               f"held views {cal.get('groups')}")
-        print(f"[calibration] {msg}", flush=True)
-        CAL_STATE["last"] = msg
+        (run_dir / "times.json").write_text(json.dumps([[t, f.name] for t, f in frames]))
+        solve_run(run_dir)
     except Exception as err:  # noqa: BLE001
         print(f"[calibration] failed: {type(err).__name__}: {err}", flush=True)
         CAL_STATE["last"] = f"failed: {err}"
     finally:
         CAL_STATE["running"] = False
+
+
+def solve_run(run_dir: Path) -> None:
+    """Work out the camera from a run's frames; save it, a contact sheet and an overlay."""
+    if (run_dir / "times.json").is_file():
+        times = json.loads((run_dir / "times.json").read_text())
+    else:                         # older runs: frames are named by seconds since the run began
+        times = [[int(f.stem), f.name] for f in sorted(run_dir.glob("[0-9]*.jpg"))]
+    frames = [(t, run_dir / name) for t, name in times]
+    print(f"[calibration] {len(frames)} frames from {run_dir.name}; solving", flush=True)
+    CAL_STATE["last"] = "solving"
+    calib.contact_sheet([f for _t, f in frames], LAB / "calibration" / "latest_sheet.jpg")
+    try:
+        cal = calib.solve(frames)
+    except ValueError as err:
+        CAL_STATE["last"] = f"failed: {err}"
+        print(f"[calibration] failed: {err}", flush=True)
+        return
+    cal["run"] = run_dir.name
+    CALIBRATION.write_text(json.dumps(cal))
+    if cal.get("P"):
+        calib.draw_overlay(Path(cal["frame"]), calib.Camera(cal["P"], cal.get("k1", 0.0)),
+                           LAB / "calibration" / "latest_overlay.jpg", cal["frame_bed_z"])
+    msg = (f"camera calibrated: {cal['points']} points at bed heights {cal['heights']}, "
+           f"error {cal['rms_px']} px (worst {cal['max_px']}), lens k1 {cal.get('k1')}; "
+           f"views {cal.get('views')}; matched {cal.get('matched')}" + (f"; {cal['note']}" if cal.get("note") else ""))
+    print(f"[calibration] {msg}", flush=True)
+    CAL_STATE["last"] = msg
+
+
+def resolve_if_stale() -> None:
+    """On start: re-solve the newest calibration run if the saved result is from older code."""
+    runs = sorted(p for p in (LAB / "calibration").glob("2*") if any(p.glob("[0-9]*.jpg"))) \
+        if (LAB / "calibration").is_dir() else []
+    if not runs:
+        return
+    _cam, cal = calib.load(CALIBRATION)
+    if cal and cal.get("version") == calib.VERSION and cal.get("run") == runs[-1].name:
+        return
+    try:
+        solve_run(runs[-1])
+    except Exception as err:  # noqa: BLE001
+        print(f"[calibration] re-solve failed: {type(err).__name__}: {err}", flush=True)
 
 
 def checked(url):
@@ -588,6 +619,11 @@ class Handler(BaseHTTPRequestHandler):
                                     "profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
         if path == "/profiles":
             return self._send(200, {"profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
+        if path in ("/calibration/latest_sheet.jpg", "/calibration/latest_overlay.jpg"):
+            f = LAB / path.lstrip("/")
+            if f.is_file():
+                return self._send(200, raw=f.read_bytes(), ctype="image/jpeg")
+            return self._send(404, {"error": "not found"})
         if path == "/frames":
             if not admin.authorised(self.headers.get("X-Admin-Token")):
                 return self._send(403, {"error": "forbidden"})
@@ -703,6 +739,7 @@ if __name__ == "__main__":
     except OSError as err:
         print(f"[print_lab] couldn't tidy the frame history: {err}", flush=True)
     threading.Thread(target=_warm, daemon=True).start()
+    threading.Thread(target=resolve_if_stale, daemon=True).start()
     class DualStackServer(ThreadingHTTPServer):
         """Answer on IPv4 and IPv6: printlab.local can resolve to either."""
         address_family = socket.AF_INET6
