@@ -295,7 +295,10 @@ def slice_job(req):
     name = str(req.get("name", ""))
     if not NAME_RE.fullmatch(name):
         raise JobError("name must be 1-60 letters, digits, - or _")
-    engine = str(req.get("slicer") or os.environ.get("PRINTLAB_SLICER", "prusa")).lower()
+    # OrcaSlicer (Anycubic's own S1 profiles) is the default since the Oct 2026 cube test; the
+    # camera calibration print stays on PrusaSlicer, whose output it was built and tested on
+    default = "prusa" if (req.get("tune") or {}).get("camera_calibration") else "orca"
+    engine = str(req.get("slicer") or os.environ.get("PRINTLAB_SLICER", default)).lower()
     if engine not in ("prusa", "orca"):
         raise JobError("slicer must be prusa or orca")
     if engine == "orca" and not orca.available():
@@ -430,7 +433,8 @@ def slice_job(req):
         data, applied = apply_temps(data, tune["temps"])
     if tune.get("retracts"):
         base = float((req.get("overrides") or {}).get("retract_length")
-                     or profile_value(profile, "retract_length") or 0)
+                     or (orca.retraction_length() if engine == "orca"
+                         else profile_value(profile, "retract_length")) or 0)
         data, retracts_applied = apply_retracts(data, tune["retracts"], base)
     if tune.get("camera_calibration"):
         data = calib.postprocess(data)

@@ -11,14 +11,22 @@ chat, which is fine, but keep anything written to files or external places clean
 - Services: `printlab` (slicer, failure detector, printer control; port 8099),
   `printlab-bot` (Telegram @RCPrintLabBot), `printlab-claude` (you).
 - Data: `/var/lib/printlab` — a bind mount of the 4 TB exFAT drive `HA_Expand` (`/mnt/ha_expand/printlab`):
-  models, gcode, profiles (`pla_08.ini`, 0.8 mm nozzle, tuned 205/210 C, 1.0 mm retraction),
-  `watch/history` (kept camera frames), `calibration/` (camera calibration runs),
+  models, gcode, profiles (`pla_08.ini`: the old PrusaSlicer profile, now only for the camera
+  calibration print), `watch/history` (kept camera frames), `calibration/` (camera calibration runs),
   `camera_calibration.json`.
 - Settings and the admin token: `/etc/printlab/printlab.env` (root:printlab 640). Printer API:
   `http://127.0.0.1:8099/printer/...` with header `X-Admin-Token`.
 - Logs: `journalctl -u printlab`, `-u printlab-bot`, `-u printlab-claude`.
 - Home Assistant (HA Green) uses Print Lab through its `kobra_print` integration
   (`/config/custom_components/kobra_print`, settings in `/config/kobra_print/lab.json`).
+
+## Slicing
+- OrcaSlicer 2.4.2 (`/opt/orcaslicer`) is the default slicer: Anycubic's own Kobra S1 profiles adapted
+  to the 0.8 mm nozzle, in `print_lab/rootfs/profiles/orca/` (rebuild with `tools/orca_profiles/build.py`).
+  It beat the old PrusaSlicer profile clearly on a 20 mm test cube (Oct 2026). PrusaSlicer is still
+  installed; `/slice` takes `slicer: prusa` to use it.
+- Rinkhals (custom firmware, Moonraker on :7125, Fluidd on :4409) is installed on the printer. The camera
+  is Rinkhals' mjpg-streamer now; the stock FLV feed on :18088 is gone.
 
 ## Rules
 - Anything physical waits for Robbie's explicit go ("send it"): starting prints, moving the head

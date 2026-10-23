@@ -23,6 +23,11 @@ def available() -> bool:
     return ORCA.is_file() and (PROFILE_DIR / "machine.json").is_file()
 
 
+def retraction_length() -> float:
+    v = json.loads((PROFILE_DIR / "machine.json").read_text()).get("retraction_length", ["0"])
+    return float(v[0] if isinstance(v, list) else v)
+
+
 def _onoff(v):
     return "1" if str(v).strip().lower() in ("1", "true", "yes", "on") else "0"
 
