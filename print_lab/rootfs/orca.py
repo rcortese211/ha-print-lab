@@ -102,7 +102,8 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
     cmd = ["xvfb-run", "-a", str(ORCA), "--slice", "0", "--arrange", "0" if keep_positions else "1",
            "--load-settings", f"{d / 'machine.json'};{d / 'process.json'}",
            "--load-filaments", str(d / "filament.json"), "--outputdir", str(outdir), *inputs]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # cwd: Orca drops log files in the working directory
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=d)
     result = {}
     try:
         result = json.loads((outdir / "result.json").read_text())
