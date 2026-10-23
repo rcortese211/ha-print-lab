@@ -240,7 +240,9 @@ def slice_job(req):
     # settings as "--key 0", but an ini line handles every setting type the same way
     overrides = {str(k): str(v) for k, v in (req.get("overrides") or {}).items()}
     if supports and "support_material" not in overrides:
-        overrides.update({"support_material": "1", "support_material_auto": "1"})
+        # grid supports: the organic style's tips can't be thinner than a 0.8 mm nozzle's line
+        overrides.update({"support_material": "1", "support_material_auto": "1",
+                          "support_material_style": "grid"})
     lines = []
     for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
