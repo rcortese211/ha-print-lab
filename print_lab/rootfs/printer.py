@@ -21,6 +21,7 @@ import string
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 
 BASE = "anycubic/anycubicCloud/v1"
@@ -224,11 +225,24 @@ class Session:
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}\.gcode")
 
 
+def _camera_answers(url: str) -> bool:
+    """True if url answers with video (FLV) or a JPEG/MJPEG stream within a few seconds."""
+    try:
+        with urllib.request.urlopen(url, timeout=4) as r:
+            kind = (r.headers.get("Content-Type") or "").lower()
+            head = r.read(16)
+        return r.status == 200 and (head.startswith(b"FLV") or "jpeg" in kind or "multipart" in kind
+                                    or head.startswith(b"\xff\xd8") or b"--" in head)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class Printer:
     def __init__(self, host: str) -> None:
         self.host = host
         self._creds: dict | None = None
         self._lock = threading.Lock()       # one session at a time
+        self._stream = None                 # (camera url, when it was checked)
 
     def _session(self) -> Session:
         if self._creds is None:
@@ -249,7 +263,22 @@ class Printer:
 
     @property
     def stream_url(self) -> str:
-        return f"http://{self.host}:18088/flv"
+        """The camera stream: the stock firmware's FLV feed, or Rinkhals' mjpg-streamer
+        (Rinkhals takes the camera over, and the FLV port goes away). Checked once a minute."""
+        now = time.time()
+        if self._stream and now - self._stream[1] < 60:
+            return self._stream[0]
+        url = self.camera_urls()[0]
+        for cand in self.camera_urls():
+            if _camera_answers(cand):
+                url = cand
+                break
+        self._stream = (url, now)
+        return url
+
+    def camera_urls(self) -> list[str]:
+        return [f"http://{self.host}:18088/flv", f"http://{self.host}:8080/?action=stream",
+                f"http://{self.host}/webcam/?action=stream"]
 
     # ---- reading
     def status(self) -> dict:

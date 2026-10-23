@@ -717,7 +717,16 @@ class Handler(BaseHTTPRequestHandler):
                 if (self.headers.get("Content-Type") or "").startswith("image/jpeg"):
                     result = DETECTOR.check(jpeg=self._body(8 * 1024 * 1024))
                 else:
-                    result = checked(str(json.loads(self._body()).get("stream_url", "")))
+                    url = str(json.loads(self._body()).get("stream_url", ""))
+                    try:
+                        # HA still sends the stock camera address; with Rinkhals on the printer
+                        # the camera lives elsewhere, and the printer object knows where
+                        p = printer()
+                        if url in p.camera_urls():
+                            url = p.stream_url
+                    except Exception:  # noqa: BLE001
+                        pass
+                    result = checked(url)
             finally:
                 DET_LOCK.release()
             print(f"[print_lab] check: score {result['score']} (best {result.get('view')}) "
