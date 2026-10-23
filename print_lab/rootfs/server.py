@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import admin
+import mesh
 import plate
 from printer import Printer, PrinterError
 from watch import Detector, WatchError
@@ -197,8 +198,20 @@ def slice_job(req):
         extra.write_text("\n".join(lines) + "\n")
         args += ["--load", str(extra)]
     out = GCODE / f"{name}.gcode"
-    # one piece: centre it; several: let the slicer arrange them (it centres the group)
-    args += (["--merge"] if len(inputs) > 1 else ["--center", "125,125"]) + ["--output", str(out), *inputs]
+    # several pieces: lay them out ourselves and slice the plate as one object (the slicer's own
+    # arrange crashes in some PrusaSlicer builds); the layout is already centred on the bed
+    pieces = len(inputs)
+    if pieces > 1:
+        plate_stl = WORK / f"{name}.plate.stl"
+        try:
+            mesh.build_plate(inputs, plate_stl)
+        except mesh.MeshError as err:
+            raise JobError(f"Couldn't lay out the plate: {err}") from err
+        inputs = [str(plate_stl)]
+        args += ["--dont-arrange"]
+    else:
+        args += ["--center", "125,125"]
+    args += ["--output", str(out), *inputs]
     try:
         run(args)
     except JobError:
@@ -239,7 +252,7 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"), "profile": profile,
-            "layers": data.count(b";LAYER_CHANGE"), "pieces": len(inputs),
+            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces,
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
             "retracts_applied": retracts_applied}
 
