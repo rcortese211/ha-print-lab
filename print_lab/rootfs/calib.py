@@ -80,6 +80,14 @@ def gray(jpg: Path) -> np.ndarray:
     return np.frombuffer(raw, np.uint8).reshape(h, w).astype(np.float32)
 
 
+def rgb(jpg: Path) -> np.ndarray:
+    g = gray(jpg)
+    h, w = g.shape
+    raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(jpg), "-f", "rawvideo",
+                          "-pix_fmt", "rgb24", "-"], capture_output=True, timeout=30).stdout
+    return np.frombuffer(raw, np.uint8).reshape(h, w, 3)
+
+
 def blobs(g: np.ndarray, max_blobs: int = 60) -> np.ndarray:
     """Centroids (x, y) of small bright blobs: white squares on a dark bed."""
     from scipy import ndimage  # noqa: PLC0415

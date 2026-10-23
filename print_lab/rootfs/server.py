@@ -37,6 +37,8 @@ import admin
 import calib
 import mesh
 import plate
+import plateguard
+import watch
 from printer import Printer, PrinterError
 from watch import Detector, WatchError
 
@@ -87,6 +89,7 @@ def stage_gcode(name, extra=None):
 
 
 CALIBRATION = LAB / "camera_calibration.json"
+GUARD = plateguard.PlateGuard(CALIBRATION, GCODE)
 CAL_STATE = {"running": False, "last": None}
 
 
@@ -146,22 +149,44 @@ def calibration_run():
 
 
 def checked(url):
-    """Score a live frame; if the camera has shown the same picture for several checks (a
-    frozen stream), restart the printer's camera and look again. Still frozen is an error,
-    so a dead feed never passes for a clean print."""
-    result = DETECTOR.check(url=url)
-    if not result.get("frozen"):
-        return result
-    print("[print_lab] camera looks frozen; restarting it", flush=True)
+    """Score a live frame: the failure model (zoomed onto the parts when the camera is
+    calibrated) plus the plate check (plastic where no part should be). If the camera has
+    shown the same picture for several checks (a frozen stream), restart it and look again;
+    still frozen is an error, so a dead feed never passes for a clean print."""
+    status = plan = None
     try:
-        printer().kick_camera()
-    except (JobError, PrinterError) as err:
-        print(f"[print_lab] couldn't restart the camera: {err}", flush=True)
-    time.sleep(3)
-    result = DETECTOR.check(url=url)
-    result["camera_restarted"] = True
+        status = printer().status()
+    except (JobError, PrinterError):
+        pass
+    try:
+        plan = GUARD.plan(status)
+    except Exception as err:  # noqa: BLE001  the plate check must never break the basic one
+        print(f"[print_lab] plate plan failed: {type(err).__name__}: {err}", flush=True)
+    crops = None
+    if plan is not None and plan.crop:
+        crops = watch.parse_crops(os.environ.get("WATCH_CROPS", watch.DEFAULT_CROPS)) + [plan.crop]
+    result = DETECTOR.check(url=url, crops=crops)
     if result.get("frozen"):
-        raise WatchError("The camera feed is frozen (same picture for several checks), even after a restart")
+        print("[print_lab] camera looks frozen; restarting it", flush=True)
+        try:
+            printer().kick_camera()
+        except (JobError, PrinterError) as err:
+            print(f"[print_lab] couldn't restart the camera: {err}", flush=True)
+        time.sleep(3)
+        result = DETECTOR.check(url=url, crops=crops)
+        result["camera_restarted"] = True
+        if result.get("frozen"):
+            raise WatchError("The camera feed is frozen (same picture for several checks), even after a restart")
+    if plan is not None:
+        try:
+            extra = GUARD.analyse(DETECTOR.dir / "last.jpg", plan)
+        except Exception as err:  # noqa: BLE001
+            extra = {"plate": f"error: {type(err).__name__}: {err}"}
+        result.update(extra)
+        result["ml_score"] = result["score"]
+        result["score"] = round(max(result["score"], extra.get("plate_score") or 0.0), 3)
+        if (extra.get("plate_score") or 0) >= 0.2:
+            DETECTOR._keep(DETECTOR.dir / "last.jpg", result["score"], False)
     return result
 
 
@@ -632,7 +657,9 @@ class Handler(BaseHTTPRequestHandler):
                 DET_LOCK.release()
             print(f"[print_lab] check: score {result['score']} (best {result.get('view')}) "
                   f"views {result.get('views')} in {result.get('inference_s')}s "
-                  f"frame {result.get('frame_size')} change {result.get('frame_change')}", flush=True)
+                  f"frame {result.get('frame_size')} change {result.get('frame_change')} "
+                  f"plate {result.get('plate')} {result.get('plate_score')} debris {result.get('debris_px')}",
+                  flush=True)
             self._send(200, result)
         except (WatchError, JobError, ValueError, subprocess.TimeoutExpired) as err:
             self._send(400, {"error": str(err)})
