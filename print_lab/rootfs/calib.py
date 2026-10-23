@@ -31,9 +31,9 @@ ROWS = {                        # row Y (mm) -> square centres X (mm); uneven so
 }
 SQUARE = 9.0                    # mm
 LAYER = 0.3                     # mm (the profile's first layer)
-DWELLS = ((1.0, 60), (12.0, 20), (25.0, 40))   # (bed Z mm, seconds held) after the layer
+DWELLS = ((1.0, 60), (12.0, 40), (25.0, 60))   # (bed Z mm, seconds held) after the layer
 NAME = "camera_calibration"
-VERSION = 3                     # bump to re-solve the last run with new code on restart
+VERSION = 4                     # bump to re-solve the last run with new code on restart
 
 
 def cross_ratio(t):
@@ -58,9 +58,16 @@ def postprocess(gcode: bytes) -> bytes:
         raise ValueError("couldn't find the end-of-print park move to add the bed dwells after")
     i = gcode.index(b"\n", i) + 1
     seq = "; camera calibration: hold the bed at known heights\n"
-    for z, secs in DWELLS:
-        seq += f"G1 Z{z:.1f} F600\nG4 S{secs}\n"
+    for z, secs in DWELLS:            # G4 takes milliseconds here; "S" is ignored by the firmware
+        seq += f"G1 Z{z:.1f} F600\nM400\nG4 P{secs * 1000}\n"
     return gcode[:i] + seq.encode() + gcode[i:]
+
+
+def scad_dots() -> str:
+    """Bed-holds-only run with the squares already printed: two tiny dots in far corners
+    (their bounding box is centred on the bed, so the slicer leaves them where they are)."""
+    return ("translate([6.5,241.5,0]) cube([3,3,0.3]);\n"
+            "translate([240.5,5.5,0]) cube([3,3,0.3]);\n")
 
 
 def expected_bbox():

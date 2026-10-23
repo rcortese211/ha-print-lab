@@ -94,45 +94,37 @@ CAL_STATE = {"running": False, "last": None}
 
 
 def calibration_run():
-    """Photograph the calibration print every few seconds, then work out the camera."""
+    """Film the calibration print (a frame every 2 s once printing starts), then work out the camera."""
     CAL_STATE.update(running=True, last="waiting for the printer to start printing")
     run_dir = LAB / "calibration" / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    frames, started, t0 = [], None, time.time()
     p = printer()
     # the printer reports idle as soon as it has read the file, while it is still holding the
-    # bed at each height, so photograph for a fixed time once printing starts
-    shoot_for = 60 + sum(secs for _z, secs in calib.DWELLS) + 90
+    # bed at each height, so film for a fixed time once printing starts
+    shoot_for = 90 + sum(secs for _z, secs in calib.DWELLS) + 60
     try:
-        last_status, state = 0.0, "busy"
-        while time.time() - t0 < 30 * 60:
-            now = time.time()
-            if started is None and now - last_status > 5:
-                last_status = now
-                try:
-                    st = p.status()
-                    job = st.get("job") or {}
-                    state = job.get("state") or st.get("state")
-                except PrinterError as err:
-                    print(f"[calibration] status: {err}", flush=True)
-                if state == "printing":
-                    started = now
-                    CAL_STATE["last"] = "photographing"
-                    try:
-                        p.kick_camera()
-                    except PrinterError:
-                        pass
-            if started is not None and now - started > shoot_for:
-                break
-            if started is not None:
-                f = run_dir / f"{int(now - t0):05d}.jpg"
-                try:
-                    DETECTOR.grab(p.stream_url, f)
-                    frames.append((now - t0, f))
-                except WatchError as err:
-                    print(f"[calibration] frame: {err}", flush=True)
-            time.sleep(3 if started is not None else 2)
-        (run_dir / "times.json").write_text(json.dumps([[t, f.name] for t, f in frames]))
+        t0, state = time.time(), None
+        while time.time() - t0 < 25 * 60 and state != "printing":
+            time.sleep(3)
+            try:
+                st = p.status()
+                state = (st.get("job") or {}).get("state") or st.get("state")
+            except PrinterError as err:
+                print(f"[calibration] status: {err}", flush=True)
+        if state != "printing":
+            raise ValueError("the calibration print never started")
+        CAL_STATE["last"] = "filming"
+        try:
+            p.kick_camera()
+        except PrinterError:
+            pass
+        started = time.time()
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-rw_timeout", "15000000",
+                        "-i", p.stream_url, "-t", str(shoot_for), "-vf", "fps=1/2", "-q:v", "3",
+                        str(run_dir / "%05d.jpg")], capture_output=True, timeout=shoot_for + 120)
+        files = sorted(run_dir.glob("[0-9]*.jpg"))
+        (run_dir / "times.json").write_text(json.dumps([[2 * i, f.name] for i, f in enumerate(files)]))
+        print(f"[calibration] filmed {len(files)} frames in {round(time.time() - started)} s", flush=True)
         solve_run(run_dir)
     except Exception as err:  # noqa: BLE001
         print(f"[calibration] failed: {type(err).__name__}: {err}", flush=True)
