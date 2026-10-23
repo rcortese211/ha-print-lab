@@ -54,6 +54,7 @@ HELP = (
     "Print Lab bot\n\n"
     "/status - printer state and a camera frame\n"
     "/files - files Print Lab has\n"
+    "/frames [n] - camera frames the failure check kept (every 5 min while printing + suspicious ones)\n"
     "/print <name> - put a Print Lab file on the printer\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
@@ -223,6 +224,8 @@ class Bot:
                 self.status(chat)
             elif word == "/files":
                 self.files(chat)
+            elif word == "/frames":
+                self.background(chat, self.frames, rest)
             elif word == "/print":
                 self.background(chat, self.stage_name, rest) if rest else \
                     self.tg.send(chat, "Which one? /print <name> - see /files")
@@ -342,6 +345,22 @@ class Bot:
             self.tg.photo(chat, jpg, "\n".join(lines))
         else:
             self.tg.send(chat, "\n".join(lines))
+
+    def frames(self, chat, rest):
+        """Send the camera frames the failure check kept (newest first)."""
+        n = max(1, min(int(rest) if rest.strip().isdigit() else 4, 10))
+        kept = self.lab.get("/frames").get("frames") or []
+        if not kept:
+            self.tg.send(chat, "No kept frames yet.")
+            return
+        for name in kept[:n]:
+            day, fname = name.split("/")
+            parts = fname[:-4].split("-")
+            when = f"{day} {parts[0][:2]}:{parts[0][2:4]}:{parts[0][4:]}"
+            caption = f"{when}  score {parts[1]}" + ("  (camera looked frozen)" if "frozen" in parts else "")
+            self.tg.photo(chat, self.lab.get(f"/frames/{name}", raw=True), caption)
+        if len(kept) > n:
+            self.tg.send(chat, f"{len(kept) - n} older frames kept; /frames 10 for more.")
 
     def lab_files(self):
         return self.lab.get("/files", timeout=15)
@@ -484,16 +503,24 @@ class Bot:
             body["models"] = items
         r = self.lab.post("/slice", body, timeout=1800) or {}
         s = r.get("sliced") or {}
+        notes = []
+        for model, o in (s.get("orientation") or {}).items():
+            if o.get("rotated"):
+                notes.append(f"Turned {model.rsplit('.', 1)[0]} onto its best face "
+                             f"({o['before']['contact_mm2']:.0f} → {o['contact_mm2']:.0f} mm² on the bed).")
+        if s.get("supports"):
+            notes.append("Supports are on: some overhangs can't print without them.")
         self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"),
-                   s.get("filament_g"), s.get("preview"), describe(labels))
+                   s.get("filament_g"), s.get("preview"), describe(labels), notes)
 
-    def ready(self, chat, filename, est, grams, preview=None, what=None):
+    def ready(self, chat, filename, est, grams, preview=None, what=None, notes=None):
         if not filename:
             self.tg.send(chat, "It sliced, but nothing got staged on the printer.")
             return
         bits = [f"{what or filename} is on the printer."]
         if est:
             bits.append(f"About {est}" + (f", {grams} g of filament." if grams else "."))
+        bits += notes or []
         bits.append("Bed clear? Reply yes to start, no to leave it.")
         text = "\n".join(bits)
         self.pending[chat] = ("start", filename, time.time())

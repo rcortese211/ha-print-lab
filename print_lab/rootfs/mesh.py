@@ -191,3 +191,82 @@ def build_plate(inputs: list[str], out: Path) -> dict:
     allv = np.concatenate(laid).reshape(-1, 3)
     lo, hi = allv.min(0), allv.max(0)
     return {"pieces": len(pieces), "footprint_mm": [round(float(hi[0] - lo[0])), round(float(hi[1] - lo[1]))]}
+
+
+# --------------------------------------------------------------------------- orientation
+def _area_normals(tris: np.ndarray):
+    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    a = np.linalg.norm(n, axis=1)
+    return a / 2, n / np.maximum(a, 1e-12)[:, None]
+
+
+def _rotation_to_down(d: np.ndarray) -> np.ndarray:
+    """Rotation matrix taking unit vector d onto (0, 0, -1)."""
+    t = np.array([0.0, 0.0, -1.0])
+    d = d / np.linalg.norm(d)
+    v, c = np.cross(d, t), float(np.dot(d, t))
+    if c > 1 - 1e-9:
+        return np.eye(3)
+    if c < -1 + 1e-9:
+        return np.diag([1.0, -1.0, -1.0])          # 180 degrees about X
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1 + c)
+
+
+OVERHANG_COS = np.cos(np.radians(45 + 90))     # faces steeper than 45 degrees past vertical, facing down
+BRIDGE_SPAN = 12.0                             # mm a horizontal ceiling can bridge without support
+
+
+def evaluate(tris: np.ndarray, area=None, normals=None) -> dict:
+    """Bed contact, unsupported overhang and height for the mesh as it sits (Z up)."""
+    if area is None:
+        area, normals = _area_normals(tris)
+    z = tris[:, :, 2]
+    zmin = z.min()
+    lowest = z.max(axis=1)
+    on_bed = (lowest < zmin + 0.15) & (normals[:, 2] < -0.985)
+    down = (normals[:, 2] < OVERHANG_COS) & ~on_bed & (z.min(axis=1) > zmin + 0.3)
+    # flat ceilings with a short span bridge fine; only count the ones that are wide
+    flat = down & (normals[:, 2] < -0.985)
+    span = np.ptp(tris[:, :, :2], axis=1).max(axis=1)
+    overhang = float(area[down & ~(flat & (span < BRIDGE_SPAN))].sum())
+    return {"contact_mm2": round(float(area[on_bed].sum()), 1), "overhang_mm2": round(overhang, 1),
+            "height_mm": round(float(np.ptp(z)), 1), "area_mm2": round(float(area.sum()), 1)}
+
+
+def orient(tris: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Rest the model on its best face: most bed contact, least overhang, then lowest.
+    Keeps the designer's orientation unless another is clearly better."""
+    area, normals = _area_normals(tris)
+    total = float(area.sum()) or 1.0
+    # candidate "down" directions: the biggest groups of same-facing triangles, plus the axes
+    key = np.round(normals, 2)
+    uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    sums = np.bincount(inv.ravel(), weights=area)
+    dirs = [uniq[i] for i in np.argsort(sums)[::-1][:24] if sums[i] > 0.01 * total]
+    dirs += [np.array(v, dtype=float) for v in ((0, 0, -1), (0, 0, 1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0))]
+
+    def cost(e):
+        # overhang is what fails; contact is what holds it down; height breaks ties
+        return e["overhang_mm2"] - 1.5 * e["contact_mm2"] + 0.002 * total * e["height_mm"]
+
+    original = evaluate(tris, area, normals)
+    best = (cost(original) - 0.05 * total, np.eye(3), original)    # the designer's choice gets a head start
+    seen = set()
+    for d in dirs:
+        k = tuple(np.round(d / np.linalg.norm(d), 3))
+        if k in seen:
+            continue
+        seen.add(k)
+        r = _rotation_to_down(np.asarray(d, dtype=float))
+        rt = tris @ r.T
+        e = evaluate(rt, area, normals @ r.T)
+        c = cost(e)
+        if c < best[0]:
+            best = (c, r, e)
+    _, r, e = best
+    rotated = not np.allclose(r, np.eye(3))
+    out = tris @ r.T if rotated else tris
+    e = dict(e, rotated=bool(rotated), before=original,
+             needs_supports=bool(e["overhang_mm2"] > max(40.0, 0.04 * total)))
+    return out, e

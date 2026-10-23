@@ -83,15 +83,37 @@ def stage_gcode(name, extra=None):
     return result
 
 
+def checked(url):
+    """Score a live frame; if the camera has shown the same picture for several checks (a
+    frozen stream), restart the printer's camera and look again. Still frozen is an error,
+    so a dead feed never passes for a clean print."""
+    result = DETECTOR.check(url=url)
+    if not result.get("frozen"):
+        return result
+    print("[print_lab] camera looks frozen; restarting it", flush=True)
+    try:
+        printer().kick_camera()
+    except (JobError, PrinterError) as err:
+        print(f"[print_lab] couldn't restart the camera: {err}", flush=True)
+    time.sleep(3)
+    result = DETECTOR.check(url=url)
+    result["camera_restarted"] = True
+    if result.get("frozen"):
+        raise WatchError("The camera feed is frozen (same picture for several checks), even after a restart")
+    return result
+
+
 def check_camera():
     """Score a live frame, starting the printer's camera stream first if it isn't running."""
     p = printer()
     try:
-        return DETECTOR.check(url=p.stream_url)
-    except WatchError:
+        return checked(p.stream_url)
+    except WatchError as err:
+        if "frozen" in str(err):
+            raise
         p.kick_camera()
         time.sleep(2)
-        return DETECTOR.check(url=p.stream_url)
+        return checked(p.stream_url)
 
 
 class JobError(Exception):
@@ -184,12 +206,43 @@ def slice_job(req):
     else:
         raise JobError("Give one of: scad, url, model, models")
 
+    # orientation + layout: models we can read get rested on their best face (unless the
+    # request says orient: false; OpenSCAD models are ours and already oriented), several
+    # pieces are laid out by us and sliced as one object (the slicer's own arrange crashes in
+    # some PrusaSlicer builds)
+    out = GCODE / f"{name}.gcode"
+    pieces = len(inputs)
+    orientation, supports = {}, False
+    readable = all(Path(p).suffix.lower() in (".stl", ".3mf", ".obj") for p in inputs)
+    want_orient = req.get("orient", True) is not False
+    if readable and (pieces > 1 or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
+        try:
+            meshes = {}
+            for p in dict.fromkeys(inputs):
+                tris = mesh.load(Path(p))
+                if want_orient and not str(p).startswith(str(WORK)):
+                    tris, info = mesh.orient(tris)
+                    orientation[Path(p).name] = info
+                    supports |= info["needs_supports"]
+                meshes[p] = tris
+            laid = mesh.arrange([meshes[p] for p in inputs])
+        except mesh.MeshError as err:
+            raise JobError(f"Couldn't lay out the plate: {err}") from err
+        plate_stl = WORK / f"{name}.plate.stl"
+        mesh.write_stl(plate_stl, laid)
+        inputs = [str(plate_stl)]
+        layout = ["--dont-arrange"]
+    else:
+        layout = ["--center", "125,125"]
+
     args = ["prusa-slicer", "--export-gcode", "--load", str(PROFILES / f"{profile}.ini")]
     # overrides go in a second ini loaded on top of the profile: the CLI can't take on/off
     # settings as "--key 0", but an ini line handles every setting type the same way
+    overrides = {str(k): str(v) for k, v in (req.get("overrides") or {}).items()}
+    if supports and "support_material" not in overrides:
+        overrides.update({"support_material": "1", "support_material_auto": "1"})
     lines = []
-    for k, v in (req.get("overrides") or {}).items():
-        k, v = str(k), str(v)
+    for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
             raise JobError(f"Bad override {k}={v}")
         lines.append(f"{k} = {v}")
@@ -197,20 +250,7 @@ def slice_job(req):
         extra = WORK / f"{name}.overrides.ini"
         extra.write_text("\n".join(lines) + "\n")
         args += ["--load", str(extra)]
-    out = GCODE / f"{name}.gcode"
-    # several pieces: lay them out ourselves and slice the plate as one object (the slicer's own
-    # arrange crashes in some PrusaSlicer builds); the layout is already centred on the bed
-    pieces = len(inputs)
-    if pieces > 1:
-        plate_stl = WORK / f"{name}.plate.stl"
-        try:
-            mesh.build_plate(inputs, plate_stl)
-        except mesh.MeshError as err:
-            raise JobError(f"Couldn't lay out the plate: {err}") from err
-        inputs = [str(plate_stl)]
-        args += ["--dont-arrange"]
-    else:
-        args += ["--center", "125,125"]
+    args += layout
     args += ["--output", str(out), *inputs]
     try:
         run(args)
@@ -252,7 +292,8 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"), "profile": profile,
-            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces,
+            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
+            "supports": overrides.get("support_material") == "1",
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
             "retracts_applied": retracts_applied}
 
@@ -439,6 +480,19 @@ class Handler(BaseHTTPRequestHandler):
                                     "profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
         if path == "/profiles":
             return self._send(200, {"profiles": sorted(p.stem for p in PROFILES.glob("*.ini"))})
+        if path == "/frames":
+            if not admin.authorised(self.headers.get("X-Admin-Token")):
+                return self._send(403, {"error": "forbidden"})
+            kept = sorted(DETECTOR.history.glob("*/*.jpg"), reverse=True)[:200] if DETECTOR.history.is_dir() else []
+            return self._send(200, {"frames": [f"{p.parent.name}/{p.name}" for p in kept]})
+        m = re.fullmatch(r"/frames/(\d{4}-\d{2}-\d{2})/([0-9]{6}-[0-9.]+(?:-frozen)?\.jpg)", path)
+        if m:
+            if not admin.authorised(self.headers.get("X-Admin-Token")):
+                return self._send(403, {"error": "forbidden"})
+            f = DETECTOR.history / m.group(1) / m.group(2)
+            if f.is_file():
+                return self._send(200, raw=f.read_bytes(), ctype="image/jpeg")
+            return self._send(404, {"error": "not found"})
         if path == "/files":
             def ls(folder, exts):
                 rows = [{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
@@ -497,12 +551,12 @@ class Handler(BaseHTTPRequestHandler):
                 if (self.headers.get("Content-Type") or "").startswith("image/jpeg"):
                     result = DETECTOR.check(jpeg=self._body(8 * 1024 * 1024))
                 else:
-                    result = DETECTOR.check(url=str(json.loads(self._body()).get("stream_url", "")))
+                    result = checked(str(json.loads(self._body()).get("stream_url", "")))
             finally:
                 DET_LOCK.release()
             print(f"[print_lab] check: score {result['score']} (best {result.get('view')}) "
                   f"views {result.get('views')} in {result.get('inference_s')}s "
-                  f"frame {result.get('frame_size')}", flush=True)
+                  f"frame {result.get('frame_size')} change {result.get('frame_change')}", flush=True)
             self._send(200, result)
         except (WatchError, JobError, ValueError, subprocess.TimeoutExpired) as err:
             self._send(400, {"error": str(err)})
@@ -536,6 +590,10 @@ if __name__ == "__main__":
             DETECTOR.status = f"error: {err}"
             print(f"[print_lab] detector not ready: {err}", flush=True)
 
+    try:
+        DETECTOR.tidy_history()
+    except OSError as err:
+        print(f"[print_lab] couldn't tidy the frame history: {err}", flush=True)
     threading.Thread(target=_warm, daemon=True).start()
     class DualStackServer(ThreadingHTTPServer):
         """Answer on IPv4 and IPv6: printlab.local can resolve to either."""

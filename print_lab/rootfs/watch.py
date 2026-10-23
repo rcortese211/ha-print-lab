@@ -12,6 +12,7 @@ Model: https://github.com/TheSpaghettiDetective/obico-server (ml_api), AGPL-3.0.
 import hashlib
 import ipaddress
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -59,6 +60,9 @@ class Detector:
         self._session = None
         self._lock = threading.Lock()
         self.status = "not loaded"
+        self._prev_thumb = None      # last frame, tiny and grey, to spot a frozen camera
+        self._still = 0              # how many checks in a row saw the same picture
+        self._last_kept = 0.0        # when a frame was last kept for the history
 
     # ------------------------------------------------------------------ model
     def ensure_model(self) -> None:
@@ -197,6 +201,37 @@ class Detector:
         return keep
 
     # ------------------------------------------------------------------ one check
+    def tidy_history(self) -> None:
+        """Older versions kept frames flat as YYYYMMDD-HHMMSS-score.jpg; file them by day."""
+        if not self.history.is_dir():
+            return
+        for f in self.history.glob("*.jpg"):
+            m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})-(\d{6})-(.+\.jpg)", f.name)
+            if m:
+                day = self.history / f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                day.mkdir(exist_ok=True)
+                f.replace(day / f"{m.group(4)}-{m.group(5)}")
+
+    def _thumb(self, jpg: Path):
+        import numpy as np  # noqa: PLC0415
+        raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(jpg), "-vf", "scale=64:36",
+                              "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True, timeout=20).stdout
+        return np.frombuffer(raw, np.uint8).astype(np.float32) if len(raw) == 64 * 36 else None
+
+    def _keep(self, frame: Path, score: float, frozen: bool) -> None:
+        """Keep a frame every 5 minutes, and every frame that looks suspicious, for 30 days."""
+        now = time.time()
+        if score < 0.2 and not frozen and now - self._last_kept < 300:
+            return
+        self._last_kept = now
+        day = self.history / time.strftime("%Y-%m-%d")
+        day.mkdir(parents=True, exist_ok=True)
+        tag = "-frozen" if frozen else ""
+        shutil.copy(frame, day / f"{time.strftime('%H%M%S')}-{score:.2f}{tag}.jpg")
+        for old in self.history.iterdir():          # prune days older than 30
+            if old.is_dir() and old.name < time.strftime("%Y-%m-%d", time.localtime(now - 30 * 86400)):
+                shutil.rmtree(old, ignore_errors=True)
+
     def check(self, url: str | None = None, jpeg: bytes | None = None, crops=None) -> dict:
         frame = self.dir / "last.jpg"
         if jpeg is not None:
@@ -207,8 +242,13 @@ class Detector:
         result = self.detect(frame, crops)
         result["frame"] = "last.jpg"
         result["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        if result["score"] > 0.3:
-            # keep suspicious frames for later tuning
-            self.history.mkdir(parents=True, exist_ok=True)
-            shutil.copy(frame, self.history / f"{time.strftime('%Y%m%d-%H%M%S')}-{result['score']:.2f}.jpg")
+        thumb = self._thumb(frame)
+        change = None
+        if thumb is not None and self._prev_thumb is not None:
+            change = float(abs(thumb - self._prev_thumb).mean())
+        self._prev_thumb = thumb
+        self._still = self._still + 1 if change is not None and change < 0.3 else 0
+        result["frame_change"] = None if change is None else round(change, 2)
+        result["frozen"] = self._still >= 3          # same picture three checks running
+        self._keep(frame, result["score"], result["frozen"])
         return result
