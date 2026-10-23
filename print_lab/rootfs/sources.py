@@ -213,14 +213,69 @@ def match(selection, cands: list[Candidate]):
         for c in cands:
             hay = re.sub(r"[^a-z0-9]+", " ", c.stem.lower())
             score = sum(1 for w in words if w in hay)
-            scored.append((score, c.name.lower().endswith(PRINTABLE), c))
-        scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+            exact = hay.split() == words or hay.replace(" ", "") == "".join(words)
+            scored.append((score, exact, c.name.lower().endswith(PRINTABLE), c))
+        scored.sort(key=lambda s: s[:3], reverse=True)
         best = scored[0]
         if best[0] == 0:
             problems.append(f"nothing matches '{phrase}'")
-        elif len(scored) > 1 and scored[1][:2] == best[:2]:
-            ties = [s[2].name for s in scored if s[:2] == best[:2]]
+        elif len(scored) > 1 and scored[1][:3] == best[:3]:
+            ties = [s[3].name for s in scored if s[:3] == best[:3]]
             problems.append(f"'{phrase}' could be {' or '.join(ties[:4])}")
         else:
-            picked.append((best[2], count))
+            picked.append((best[3], count))
     return picked, problems
+
+
+# --------------------------------------------------------------------------- "all ..." filters
+FILLER = {"files", "file", "ones", "one", "that", "which", "say", "says", "with", "named", "called",
+          "containing", "contain", "contains", "have", "has", "of", "the", "them", "in", "name",
+          "names", "their", "please", "print", "me", "those", "these"}
+ALL_RE = re.compile(r"^\s*(?:(\d{1,2})\s*(?:x|×|copies of|of)?\s+)?(?:all|every|everything)\b(.*)$", re.I | re.S)
+
+
+def select_all(text: str, cands: list[Candidate]):
+    """'all 19x', 'every file that says 19x but not the ones without the x', 'all except base',
+    '2 of each of all small' -> ([(Candidate, count)], problems), or None if text isn't an 'all'."""
+    m = ALL_RE.match(text)
+    each = re.match(r"^\s*(\d{1,2})\s*[x×]?\s*(?:copies\s+)?(?:of\s+)?each\b(?:\s+of)?(.*)$", text, re.I | re.S)
+    if not m and not each:
+        return None
+    count, rest = (int(m.group(1) or 1), m.group(2)) if m else (int(each.group(1)), each.group(2))
+    if e := re.search(r"(?:\b(\d{1,2})\s*(?:of\s+)?each\b|\b[x×](\d{1,2})\s*(?:each)?\s*$|\beach\s*[x×]\s*(\d{1,2}))", rest, re.I):
+        count = int(next(g for g in e.groups() if g))
+        rest = rest[:e.start()] + rest[e.end():]
+    split = re.search(r"\b(?:but not|except|excluding|minus|not|but)\b", rest, re.I)
+    inc_text, exc_text = (rest[:split.start()], rest[split.end():]) if split else (rest, "")
+
+    def terms(t):
+        return [w for w in re.split(r"[^a-z0-9]+", t.lower()) if w and w not in FILLER]
+
+    include, exclude = terms(inc_text), []
+    # "not the ones without the x" means the x is required; "except base" means base is excluded
+    for clause in re.split(r",", exc_text):
+        if re.search(r"\b(without|lacking|missing|no)\b", clause, re.I):
+            include += [w for w in terms(re.split(r"\b(?:without|lacking|missing|no)\b", clause, 1, flags=re.I)[1])
+                        if w not in ("without", "lacking", "missing", "no")]
+        else:
+            exclude += terms(clause)
+
+    def name(c):
+        return re.sub(r"[^a-z0-9]+", " ", c.name.lower())
+
+    hits = [c for c in cands
+            if all(t in name(c) for t in include) and not any(t in name(c).split() or t in name(c) for t in exclude)]
+    printable = [c for c in hits if c.name.lower().endswith(PRINTABLE)]
+    hits = printable or hits
+    if not hits:
+        what = " ".join(include) or "anything"
+        return [], [f"no files match '{what}'" + (f" without '{' '.join(exclude)}'" if exclude else "")]
+    return [(c, count) for c in hits], []
+
+
+def select(text: str, cands: list[Candidate]):
+    """Pick files from a reply: an 'all ...' filter, or phrases with counts."""
+    result = select_all(text, cands)
+    if result is not None:
+        return result
+    return match(parse_selection(text), cands)

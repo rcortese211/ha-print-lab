@@ -57,7 +57,8 @@ HELP = (
     "/print <name> - put a Print Lab file on the printer\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
-    "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large\n"
+    "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large,\n"
+    "  or filter by name: all 19x, all except base, 2 of each 19x\n"
     "/print hook x3, clip x5 - same with models Print Lab already has\n"
     "/pause  /resume  /stop\n"
     "Nothing starts or stops until you reply yes."
@@ -393,12 +394,11 @@ class Bot:
         if len(links) == 1:
             url, count = links[0]
             title, cands = sources.resolve(url)
-            selection = sources.parse_selection(words) if words else []
-            if not selection and len(cands) == 1:
+            if not words and len(cands) == 1:
                 return self.fetch_and_ask(chat, [(cands[0], count)])
-            if not selection:
+            if not words:
                 return self.list_files_to_pick(chat, title, cands)
-            picked, problems = sources.match(selection, cands)
+            picked, problems = sources.select(words, cands)
             if problems or not picked:
                 return self.list_files_to_pick(chat, title, cands, problems)
             return self.fetch_and_ask(chat, picked)
@@ -424,12 +424,13 @@ class Bot:
         lines.append(f"{title} has {len(cands)} files:")
         for i, c in enumerate(cands, 1):
             lines.append(f"  {i}. {c.name}" + (f"  ({max(1, round(c.size / 1024))} KB)" if c.size else ""))
-        lines.append('Which ones, and how many? e.g. "2 small, 2 large" or "1 x2, 2 x2"')
+        lines.append('Which ones, and how many? e.g. "2 small, 2 large", "1 x2, 2 x2", '
+                     '"all 19x", "2 of each except base"')
         self.tg.send(chat, "\n".join(lines))
 
     def pick_files(self, chat, text):
         _action, (title, cands), _since = self.pending[chat]
-        picked, problems = sources.match(sources.parse_selection(text), cands)
+        picked, problems = sources.select(text, cands)
         if problems or not picked:
             return self.list_files_to_pick(chat, title, cands, problems or ["I didn't catch which files"])
         del self.pending[chat]
