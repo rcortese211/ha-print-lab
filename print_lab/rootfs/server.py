@@ -154,11 +154,18 @@ def slice_job(req):
         model = stl
 
     args = ["prusa-slicer", "--export-gcode", "--load", str(PROFILES / f"{profile}.ini")]
+    # overrides go in a second ini loaded on top of the profile: the CLI can't take on/off
+    # settings as "--key 0", but an ini line handles every setting type the same way
+    lines = []
     for k, v in (req.get("overrides") or {}).items():
         k, v = str(k), str(v)
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
             raise JobError(f"Bad override {k}={v}")
-        args += [f"--{k.replace('_', '-')}", v]
+        lines.append(f"{k} = {v}")
+    if lines:
+        extra = WORK / f"{name}.overrides.ini"
+        extra.write_text("\n".join(lines) + "\n")
+        args += ["--load", str(extra)]
     out = GCODE / f"{name}.gcode"
     args += ["--center", "125,125", "--output", str(out), str(model)]
     try:

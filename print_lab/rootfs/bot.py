@@ -38,13 +38,22 @@ MODEL_EXT = (".stl", ".3mf", ".obj", ".step", ".stp")
 TOKEN = os.environ.get("PRINTLAB_ADMIN_TOKEN", "")
 CONFIRM_FOR = 15 * 60
 LINK_RE = re.compile(r"https?://\S+")
+# Quality presets for links, as overrides on the tuned profile (pla_08, 0.8 mm nozzle). Its
+# flow cap (15 mm3/s) sets the real speed, so these change layers, walls, infill and ironing.
+QUALITY = {
+    "fast": ("Fast", {"layer_height": "0.5", "fill_density": "10%", "ironing": "0",
+                      "top_solid_layers": "3"}),
+    "medium": ("Medium", {}),
+    "high": ("High quality", {"layer_height": "0.24", "perimeters": "3", "external_perimeter_speed": "30",
+                              "top_solid_layers": "6", "bottom_solid_layers": "5", "fill_density": "20%"}),
+}
 
 HELP = (
     "Print Lab bot\n\n"
     "/status - printer state and a camera frame\n"
     "/files - files Print Lab has\n"
     "/print <name> - put a Print Lab file on the printer\n"
-    "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it\n"
+    "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "/pause  /resume  /stop\n"
     "Nothing starts or stops until you reply yes."
 )
@@ -93,6 +102,11 @@ class Telegram:
         if not r.get("ok"):
             raise Err(r.get("description", "Telegram error"))
         return r["result"]
+
+    def buttons(self, chat, text, rows):
+        """A message with tap buttons: rows of (label, callback_data)."""
+        return self.api("sendMessage", {"chat_id": chat, "text": text, "reply_markup": {
+            "inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}})
 
     def send(self, chat, text):
         for i in range(0, max(len(text), 1), 4000):
@@ -187,12 +201,31 @@ class Bot:
                 self.confirm(chat)
             elif word in ("no", "n", "/no", "/cancel", "cancel"):
                 self.tg.send(chat, "Cancelled." if self.pending.pop(chat, None) else "Nothing was waiting.")
+            elif word in QUALITY:
+                self.choose_quality(chat, word)
             elif LINK_RE.search(text):
                 self.background(chat, self.stage_link, LINK_RE.search(text).group(0))
             else:
                 self.tg.send(chat, "Not sure what you mean. /help lists what I can do.")
         except Err as err:
             self.tg.send(chat, f"That didn't work: {err}")
+
+    def handle_button(self, cq):
+        sender = cq.get("from", {}).get("id")
+        msg = cq.get("message") or {}
+        chat = msg.get("chat", {}).get("id")
+        self.tg.api("answerCallbackQuery", {"callback_query_id": cq["id"]})
+        if sender not in self.chats or chat not in self.chats:
+            log(f"ignored a button press from {sender}")
+            return
+        data = str(cq.get("data", ""))
+        if data.startswith("q:") and data[2:] in QUALITY:
+            try:   # drop the buttons so they can't be pressed twice
+                self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "reply_markup": {"inline_keyboard": []}})
+            except Err:
+                pass
+            self.choose_quality(chat, data[2:])
 
     def background(self, chat, fn, arg):
         if self.job and self.job.is_alive():
@@ -323,8 +356,25 @@ class Bot:
             return
         stem = os.path.basename(urllib.parse.urlsplit(file_url).path).rsplit(".", 1)[0]
         name = safe_name(urllib.parse.unquote(stem))
-        self.tg.send(chat, f"Downloading and slicing {name} (a few minutes)...")
-        r = self.lab.post("/slice", {"name": name, "url": file_url, "stage": True}, timeout=1800) or {}
+        self.pending[chat] = ("quality", (file_url, name), time.time())
+        self.tg.buttons(chat, f"Found {os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(file_url).path))}. "
+                              "How should I print it?",
+                        [[(QUALITY[k][0], f"q:{k}") for k in ("fast", "medium", "high")]])
+
+    def choose_quality(self, chat, key):
+        action, arg, since = self.pending.get(chat, (None, None, 0))
+        if action != "quality" or time.time() - since > CONFIRM_FOR:
+            self.tg.send(chat, "Send me a link first.")
+            return
+        del self.pending[chat]
+        self.background(chat, self.slice_link, (arg[0], arg[1], key))
+
+    def slice_link(self, chat, job):
+        file_url, name, key = job
+        label, overrides = QUALITY[key]
+        self.tg.send(chat, f"Downloading and slicing {name} ({label}, a few minutes)...")
+        r = self.lab.post("/slice", {"name": name, "url": file_url, "stage": True, "overrides": overrides},
+                          timeout=1800) or {}
         s = r.get("sliced") or {}
         self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"), s.get("filament_g"))
 
@@ -349,13 +399,18 @@ class Bot:
                 return
             try:
                 updates = self.tg.api("getUpdates", {"timeout": 50, "offset": offset,
-                                                     "allowed_updates": ["message"]}, timeout=65)
+                                                     "allowed_updates": ["message", "callback_query"]}, timeout=65)
             except Err as err:
                 log("getUpdates:", err)
                 time.sleep(15)
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
+                if "callback_query" in u:
+                    try:
+                        self.handle_button(u["callback_query"])
+                    except Err as err:
+                        log("button failed:", err)
                 if "message" in u:
                     try:
                         self.handle(u["message"])
