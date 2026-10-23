@@ -19,6 +19,7 @@ for k in ("nozzle_diameter", "max_layer_height", "min_layer_height", "wipe_dista
 m.update(name=NAME, printer_settings_id=NAME, printer_variant="0.8", inherits="", **{"from": "system"},
          default_print_profile="", default_filament_profile=[])
 m.pop("setting_id", None)
+m["default_bed_type"] = "Textured PEI Plate"  # the S1's stock plate
 procs = {"high": "0.24mm Standard @Anycubic Kobra S1 Max 0.8 nozzle",
          "medium": "0.32mm Standard @Anycubic Kobra S1 Max 0.8 nozzle",
          "fast": "0.48mm Standard @Anycubic Kobra S1 Max 0.8 nozzle"}
@@ -26,7 +27,8 @@ out = {"machine": m}
 for q, n in procs.items():
     p = flat("process", n)
     p.update(compatible_printers=[NAME], inherits="", **{"from": "system"},
-             name=f"Print Lab {q} 0.8", print_settings_id=f"Print Lab {q} 0.8")
+             name=f"Print Lab {q} 0.8", print_settings_id=f"Print Lab {q} 0.8",
+             curr_bed_type="Textured PEI Plate")
     p.pop("setting_id", None)
     out[f"process_{q}"] = p
 f = flat("filament", "Anycubic PLA @Anycubic Kobra S1 Max 0.8 nozzle")

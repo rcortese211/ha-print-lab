@@ -23,6 +23,7 @@
  ],
  "compatible_printers_condition": "",
  "counterbore_hole_bridging": "none",
+ "curr_bed_type": "Textured PEI Plate",
  "default_acceleration": "10000",
  "default_jerk": "9",
  "detect_narrow_internal_solid_infill": "1",
