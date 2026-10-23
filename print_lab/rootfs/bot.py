@@ -496,7 +496,8 @@ class Bot:
         label, overrides = QUALITY[key]
         name = plate_name(labels)
         self.tg.send(chat, f"Slicing {describe(labels)} ({label}, a few minutes)...")
-        body = {"name": name, "stage": True, "overrides": overrides}
+        # PrusaSlicer applies the preset as overrides; OrcaSlicer uses Anycubic's own process
+        body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides}
         if len(items) == 1 and items[0]["count"] == 1:
             body.update({k: v for k, v in items[0].items() if k != "count"})
         else:

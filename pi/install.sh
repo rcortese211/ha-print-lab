@@ -52,6 +52,23 @@ install -m 644 "$REPO/pi/printlab.service" "$REPO/pi/printlab-update.service" \
 install -m 440 "$REPO/pi/sudoers" /etc/sudoers.d/printlab.new
 visudo -cf /etc/sudoers.d/printlab.new && mv /etc/sudoers.d/printlab.new /etc/sudoers.d/printlab
 
+# OrcaSlicer (official ARM64 AppImage, unpacked so it runs without FUSE)
+ORCA_VER=2.4.2
+if [ "$(cat /opt/orcaslicer/.version 2>/dev/null)" != "$ORCA_VER" ]; then
+    tmp=$(mktemp -d)
+    if curl -fsSL -o "$tmp/orca.AppImage" \
+        "https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v$ORCA_VER/OrcaSlicer_Linux_AppImage_Ubuntu2404_aarch64_V$ORCA_VER.AppImage"; then
+        chmod +x "$tmp/orca.AppImage"
+        (cd "$tmp" && ./orca.AppImage --appimage-extract >/dev/null)
+        rm -rf /opt/orcaslicer && mv "$tmp/squashfs-root" /opt/orcaslicer
+        echo "$ORCA_VER" > /opt/orcaslicer/.version
+        chmod -R a+rX /opt/orcaslicer
+    else
+        echo "Couldn't download OrcaSlicer $ORCA_VER; keeping what's there"
+    fi
+    rm -rf "$tmp"
+fi
+
 # Claude Code (Anthropic's signed apt repository), for a Remote Control session on this Pi
 if ! command -v claude >/dev/null 2>&1; then
     command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg

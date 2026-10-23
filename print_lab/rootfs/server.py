@@ -36,6 +36,7 @@ from pathlib import Path
 import admin
 import calib
 import mesh
+import orca
 import plate
 import plateguard
 import watch
@@ -294,8 +295,13 @@ def slice_job(req):
     name = str(req.get("name", ""))
     if not NAME_RE.fullmatch(name):
         raise JobError("name must be 1-60 letters, digits, - or _")
+    engine = str(req.get("slicer") or os.environ.get("PRINTLAB_SLICER", "prusa")).lower()
+    if engine not in ("prusa", "orca"):
+        raise JobError("slicer must be prusa or orca")
+    if engine == "orca" and not orca.available():
+        raise JobError("OrcaSlicer isn't installed on the Pi")
     profile = str(req.get("profile", "pla_08"))
-    if not NAME_RE.fullmatch(profile) or not (PROFILES / f"{profile}.ini").is_file():
+    if engine == "prusa" and (not NAME_RE.fullmatch(profile) or not (PROFILES / f"{profile}.ini").is_file()):
         raise JobError(f"Unknown profile '{profile}'")
 
     inputs = []
@@ -343,44 +349,67 @@ def slice_job(req):
             laid = mesh.arrange([meshes[p] for p in inputs])
         except mesh.MeshError as err:
             raise JobError(f"Couldn't lay out the plate: {err}") from err
-        plate_stl = WORK / f"{name}.plate.stl"
-        mesh.write_stl(plate_stl, laid)
-        inputs = [str(plate_stl)]
+        if engine == "orca":
+            # one file per piece, kept where we laid it: Orca makes each its own object, so a
+            # single failed piece can be cancelled (EXCLUDE_OBJECT) without stopping the plate
+            for old in WORK.glob(f"{name}.p*.stl"):
+                old.unlink()
+            inputs = []
+            for i, part in enumerate(laid):
+                part_stl = WORK / f"{name}.p{i + 1:02d}.stl"
+                mesh.write_stl(part_stl, [part])
+                inputs.append(str(part_stl))
+        else:
+            plate_stl = WORK / f"{name}.plate.stl"
+            mesh.write_stl(plate_stl, laid)
+            inputs = [str(plate_stl)]
         layout = ["--dont-arrange"]
     else:
         layout = ["--center", "125,125"]
 
-    args = ["prusa-slicer", "--export-gcode", "--load", str(PROFILES / f"{profile}.ini")]
-    # overrides go in a second ini loaded on top of the profile: the CLI can't take on/off
-    # settings as "--key 0", but an ini line handles every setting type the same way
-    overrides = {str(k): str(v) for k, v in (req.get("overrides") or {}).items()}
+    # "quality" + "quality_overrides" come from the bot's presets: PrusaSlicer gets the preset as
+    # overrides on its one tuned profile, Orca picks Anycubic's own process for that quality
+    quality = str(req.get("quality") or "")
+    overrides = {}
+    if engine == "prusa":
+        overrides.update({str(k): str(v) for k, v in (req.get("quality_overrides") or {}).items()})
+    overrides.update({str(k): str(v) for k, v in (req.get("overrides") or {}).items()})
     if supports and "support_material" not in overrides:
         # grid supports: the organic style's tips can't be thinner than a 0.8 mm nozzle's line
         overrides.update({"support_material": "1", "support_material_auto": "1",
                           "support_material_style": "grid"})
-    lines = []
     for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
             raise JobError(f"Bad override {k}={v}")
-        lines.append(f"{k} = {v}")
-    if lines:
-        extra = WORK / f"{name}.overrides.ini"
-        extra.write_text("\n".join(lines) + "\n")
-        args += ["--load", str(extra)]
-    args += layout
-    args += ["--output", str(out), *inputs]
     out.unlink(missing_ok=True)
-    try:
-        p = run(args)
-    except JobError:
-        p = run(["xvfb-run", "-a", *args])  # some builds want a display even headless
-    if not out.is_file():
-        tail = " | ".join((p.stdout + p.stderr).strip().splitlines()[-6:])
-        raise JobError(f"The slicer finished without making G-code: {tail or 'no message'}"
-                       + (f" (orientation: {json.dumps(orientation)})" if orientation else ""))
+    orca_info = None
+    if engine == "orca":
+        try:
+            orca_info = orca.slice_files(name, inputs, layout == ["--dont-arrange"],
+                                         quality or orca.quality_for(overrides), overrides, out, WORK)
+        except (orca.OrcaError, subprocess.TimeoutExpired, ValueError) as err:
+            raise JobError(f"{err}" + (f" (orientation: {json.dumps(orientation)})" if orientation else "")) from err
+    else:
+        # overrides go in a second ini loaded on top of the profile: the CLI can't take on/off
+        # settings as "--key 0", but an ini line handles every setting type the same way
+        args = ["prusa-slicer", "--export-gcode", "--load", str(PROFILES / f"{profile}.ini")]
+        if overrides:
+            extra = WORK / f"{name}.overrides.ini"
+            extra.write_text("".join(f"{k} = {v}\n" for k, v in overrides.items()))
+            args += ["--load", str(extra)]
+        args += layout
+        args += ["--output", str(out), *inputs]
+        try:
+            p = run(args)
+        except JobError:
+            p = run(["xvfb-run", "-a", *args])  # some builds want a display even headless
+        if not out.is_file():
+            tail = " | ".join((p.stdout + p.stderr).strip().splitlines()[-6:])
+            raise JobError(f"The slicer finished without making G-code: {tail or 'no message'}"
+                           + (f" (orientation: {json.dumps(orientation)})" if orientation else ""))
 
     data = out.read_bytes()
-    cut = data.find(b"; prusaslicer_config = begin")
+    cut = data.find(b"; prusaslicer_config = begin") if engine == "prusa" else -1
     if cut > 0:
         data = data[:cut]
         out.write_bytes(data)
@@ -408,7 +437,8 @@ def slice_job(req):
         out.write_bytes(data)
     elif applied or retracts_applied:
         out.write_bytes(data)
-    tail = data[-6000:].decode(errors="ignore")
+    cfg = data.rfind(b"; CONFIG_BLOCK_START")      # Orca: the summary sits just before its config
+    tail = (data[max(0, cfg - 6000):cfg] if cfg > 0 else data[-6000:]).decode(errors="ignore")
 
     def grab(label):
         m = re.search(rf"^; {re.escape(label)} = (.+)$", tail, re.M)
@@ -416,7 +446,9 @@ def slice_job(req):
 
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
-            "filament_g": grab("filament used [g]"), "profile": profile,
+            "filament_g": grab("filament used [g]"),
+            "profile": profile if engine == "prusa" else f"orca {orca_info['quality']}",
+            "slicer": engine, "orca": orca_info,
             "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
             "supports": overrides.get("support_material") == "1",
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
