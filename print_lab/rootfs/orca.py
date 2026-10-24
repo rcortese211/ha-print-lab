@@ -106,9 +106,13 @@ def _set(profiles: dict, key: str, value: str) -> None:
 
 
 def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str,
-                overrides: dict, out: Path, work: Path, nozzle, timeout: int = 1800) -> dict:
+                overrides: dict, out: Path, work: Path, nozzle, filaments: list | None = None,
+                filament_ids: list[int] | None = None, timeout: int = 1800) -> dict:
     """Slice inputs (one object per file) into out with the profiles for this nozzle.
-    Returns Orca's result summary."""
+
+    filaments: colours in order ({color, material, temp?}); filament_ids: the colour (1-based)
+    of each input. One colour per object; the printer's ACE does the swaps (no prime tower,
+    the firmware purges into its chute). Returns Orca's result summary."""
     if quality not in QUALITIES:
         raise OrcaError(f"quality must be one of {', '.join(QUALITIES)}")
     pdir = profile_dir(nozzle)
@@ -130,13 +134,40 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
     d = work / f"{name}.orca"
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True)
+    fil_files = [d / "filament.json"]
+    if filaments and len(filaments) > 1:
+        # several colours: one filament file each, no prime tower (the ACE purges at the chute)
+        profiles["process"]["enable_prime_tower"] = "0"
+        fil_files = []
+        for i, f in enumerate(filaments, 1):
+            fil = json.loads(json.dumps(profiles["filament"]))
+            fil["name"] = f"{fil['name']} {i}"
+            fil["filament_settings_id"] = [fil["name"]]
+            fil["filament_colour"] = [f["color"].upper()]
+            if f.get("temp"):
+                fil["nozzle_temperature"] = [str(f["temp"])]
+                fil["nozzle_temperature_initial_layer"] = [str(f["temp"])]
+            fil_files.append(d / f"filament_{i}.json")
+            fil_files[-1].write_text(json.dumps(fil, indent=1))
+    elif filaments:
+        profiles["filament"]["filament_colour"] = [filaments[0]["color"].upper()]
+        if filaments[0].get("temp"):
+            profiles["filament"]["nozzle_temperature"] = [str(filaments[0]["temp"])]
+            profiles["filament"]["nozzle_temperature_initial_layer"] = [str(filaments[0]["temp"])]
     for kind, data in profiles.items():
+        if kind == "filament" and len(fil_files) > 1:
+            continue
         (d / f"{kind}.json").write_text(json.dumps(data, indent=1))
     outdir = d / "out"
     outdir.mkdir()
     cmd = ["xvfb-run", "-a", str(ORCA), "--slice", "0", "--arrange", "0" if keep_positions else "1",
            "--load-settings", f"{d / 'machine.json'};{d / 'process.json'}",
-           "--load-filaments", str(d / "filament.json"), "--outputdir", str(outdir), *inputs]
+           "--load-filaments", ";".join(str(f) for f in fil_files), "--outputdir", str(outdir)]
+    if filaments and len(filaments) > 1 and filament_ids:
+        if len(filament_ids) != len(inputs):
+            raise OrcaError("internal: one colour per piece needed")
+        cmd += ["--load-filament-ids", ",".join(str(int(i)) for i in filament_ids)]
+    cmd += inputs
     # cwd: Orca drops log files in the working directory
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=d)
     result = {}

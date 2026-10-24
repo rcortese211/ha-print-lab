@@ -378,7 +378,9 @@ class Printer:
             payload = {
                 "taskid": "-1", "url": "", "filename": staged["filename"], "md5": staged["md5"],
                 "filepath": None, "filetype": 1, "project_type": 1, "filesize": staged["size"],
-                "ams_settings": {"use_ams": False, "ams_box_mapping": []},
+                # multi-colour: which ACE slot feeds each of the file's colours
+                "ams_settings": {"use_ams": bool(staged.get("ams_box_mapping")),
+                                 "ams_box_mapping": staged.get("ams_box_mapping") or []},
                 "task_settings": {"auto_leveling": int(auto_leveling), "vibration_compensation": 0,
                                   "flow_calibration": 0, "dry_mode": 0,
                                   "ai_settings": {"status": 0, "count": 0, "type": 0},

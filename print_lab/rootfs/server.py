@@ -94,6 +94,75 @@ def fitted_nozzle():
         return None, None
 
 
+HEX_RE = re.compile(r"#?([0-9a-fA-F]{6})")
+
+
+def parse_filaments(raw):
+    """[{slot: 1-4, color: "#rrggbb", material: "PLA", temp?: 170-280}, ...] -> checked list."""
+    if not raw:
+        return []
+    if not isinstance(raw, list) or len(raw) > 4:
+        raise JobError("filaments must be a list of up to 4 entries")
+    out = []
+    for i, f in enumerate(raw, 1):
+        try:
+            slot = int(f["slot"])
+        except (KeyError, TypeError, ValueError) as err:
+            raise JobError(f"filament {i} needs a slot (1-4)") from err
+        if not 1 <= slot <= 4:
+            raise JobError(f"filament {i}: slot must be 1-4")
+        m = HEX_RE.fullmatch(str(f.get("color") or "#ffffff"))
+        if not m:
+            raise JobError(f"filament {i}: color must be #rrggbb")
+        material = re.sub(r"[^A-Za-z0-9 +-]", "", str(f.get("material") or "PLA"))[:20] or "PLA"
+        entry = {"slot": slot, "color": "#" + m.group(1).lower(), "material": material}
+        if f.get("temp") is not None:
+            temp = int(f["temp"])
+            if not 170 <= temp <= 280:
+                raise JobError(f"filament {i}: temp must be 170-280")
+            entry["temp"] = temp
+        out.append(entry)
+    return out
+
+
+def colour_changes(data: bytes) -> int:
+    """How many times the G-code switches filament (T0 -> T1 ...)."""
+    seq = re.findall(rb"^T(\d+)\b", data, re.M)
+    return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+
+
+def ams_mapping(colours):
+    """The printer's start-command mapping (Anycubic's ams_box_mapping): colour n -> ACE slot."""
+    out = []
+    for i, c in enumerate(colours):
+        rgb = [int(c["color"][k:k + 2], 16) for k in (1, 3, 5)]
+        out.append({"paint_index": i, "ams_index": c["slot"] - 1, "paint_color": rgb, "ams_color": rgb,
+                    "material_type": c["material"], "filament_used": c.get("grams") or 0})
+    return out
+
+
+def ace_slots():
+    """What's in each ACE slot, from Rinkhals' Moonraker (mmu object)."""
+    host = json.loads(PRINTER_CFG.read_text()).get("host")
+    try:
+        with urllib.request.urlopen(f"http://{host}:7125/printer/objects/query?mmu", timeout=5) as r:
+            m = json.load(r)["result"]["status"]["mmu"]
+    except Exception as err:  # noqa: BLE001
+        raise JobError(f"Couldn't read the ACE from the printer ({err})") from err
+    status, materials, colors = m.get("gate_status") or [], m.get("gate_material") or [], m.get("gate_color") or []
+    names = m.get("gate_filament_name") or []
+    temps = m.get("gate_temperature") or []
+    slots = []
+    for i in range(int(m.get("num_gates") or len(status))):
+        col = str(colors[i] if i < len(colors) else "")[:6].lower()
+        slots.append({"slot": i + 1, "loaded": bool(status[i]) if i < len(status) else False,
+                      "material": (materials[i] if i < len(materials) else "") or "",
+                      "name": (names[i] if i < len(names) else "") or "",
+                      "color": "#" + col if HEX_RE.fullmatch(col) else None,
+                      "temp": (temps[i] if i < len(temps) else 0) or None})
+    return {"slots": slots, "loaded_slot": (m.get("gate") + 1) if isinstance(m.get("gate"), int) and m.get("gate") >= 0 else None}
+
+
 def read_staged():
     try:
         return json.loads(STAGED.read_text())
@@ -107,6 +176,14 @@ def stage_gcode(name, extra=None):
     if not path.is_file() or path.suffix != ".gcode":
         raise JobError(f"Print Lab has no {path.name}")
     result = printer().stage(path.name, path.read_bytes())
+    sidecar = GCODE / f"{path.stem}.ams.json"
+    if sidecar.is_file():
+        try:
+            colour_info = json.loads(sidecar.read_text())
+            result = {**result, "ams_box_mapping": colour_info["ams_box_mapping"],
+                      "colours": colour_info.get("colours")}
+        except (OSError, ValueError, KeyError):
+            pass
     STAGED.write_text(json.dumps({**result, **(extra or {}),
                                   "staged_at": time.strftime("%Y-%m-%d %H:%M:%S")}))
     return result
@@ -343,7 +420,12 @@ def slice_job(req):
     if engine == "prusa" and (not NAME_RE.fullmatch(profile) or not (PROFILES / f"{profile}.ini").is_file()):
         raise JobError(f"Unknown profile '{profile}'")
 
-    inputs = []
+    # multi-colour: filaments is the list of ACE slots used, in colour order (colour 1 first);
+    # each models entry says which colour it prints in ("filament": 1-based, default 1)
+    filaments = parse_filaments(req.get("filaments"))
+    if filaments and engine != "orca":
+        raise JobError("Colours need OrcaSlicer")
+    inputs, piece_filament = [], []
     if req.get("models"):
         items = req["models"]
         if not isinstance(items, list) or not 1 <= len(items) <= 12:
@@ -352,7 +434,12 @@ def slice_job(req):
             count = int(item.get("count", 1))
             if not 1 <= count <= 50:
                 raise JobError("count must be 1-50")
+            fil = int(item.get("filament", 1))
+            if not 1 <= fil <= max(1, len(filaments)):
+                raise JobError(f"models entry {i + 1} asks for colour {fil}, but only "
+                               f"{max(1, len(filaments))} colour(s) were given")
             inputs += [str(model_input(item, f"{name}_{i + 1}"))] * count
+            piece_filament += [fil] * count
         if len(inputs) > 100:
             raise JobError("That's more than 100 pieces on one plate")
     elif req.get("scad"):
@@ -365,6 +452,9 @@ def slice_job(req):
         inputs = [str(model_input({"model": req["model"]}, name))]
     else:
         raise JobError("Give one of: scad, url, model, models")
+
+    if not piece_filament:
+        piece_filament = [1] * len(inputs)
 
     # orientation + layout: models we can read get rested on their best face (unless the
     # request says orient: false; OpenSCAD models are ours and already oriented), several
@@ -434,7 +524,8 @@ def slice_job(req):
         try:
             orca_info = orca.slice_files(name, inputs, layout == ["--dont-arrange"],
                                          quality or orca.quality_for(overrides, nozzle), overrides,
-                                         out, WORK, nozzle)
+                                         out, WORK, nozzle, filaments=filaments or None,
+                                         filament_ids=piece_filament if filaments else None)
         except (orca.OrcaError, subprocess.TimeoutExpired, ValueError) as err:
             raise JobError(f"{err}" + (f" (orientation: {json.dumps(orientation)})" if orientation else "")) from err
     else:
@@ -496,9 +587,24 @@ def slice_job(req):
         m = re.search(rf"^; {re.escape(label)} = (.+)$", tail, re.M)
         return m.group(1).strip() if m else None
 
+    # colour -> ACE slot mapping for the start command, kept next to the G-code so staging it
+    # later (/printer/stage, the bot's /print) still knows which slot feeds which colour
+    sidecar = GCODE / f"{out.stem}.ams.json"
+    colours = None
+    if filaments:
+        grams = [float(g) for g in re.findall(r"[0-9.]+", grab("filament used [g]") or "")]
+        colours = [{**f, "grams": round(grams[i], 2) if i < len(grams) else None}
+                   for i, f in enumerate(filaments)]
+        sidecar.write_text(json.dumps({"ams_box_mapping": ams_mapping(colours), "colours": colours}))
+    else:
+        sidecar.unlink(missing_ok=True)
+
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
+            "colours": colours,
+            "colour_changes": colour_changes(data) if colours else 0,
             "estimated_time": grab("estimated printing time (normal mode)"),
-            "filament_g": grab("filament used [g]"),
+            "filament_g": (lambda g: f"{sum(float(x) for x in re.findall(r'[0-9.]+', g)):.2f}" if g else None)(
+                grab("filament used [g]")),
             "profile": profile if engine == "prusa" else f"orca {orca_info['quality']} ({nozzle} mm nozzle)",
             "slicer": engine, "orca": orca_info, "nozzle": nozzle, "nozzle_from": nozzle_from,
             "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
@@ -650,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise JobError("host must be an IP address or host name")
                 PRINTER_CFG.write_text(json.dumps({"host": host}))
                 return self._send(200, {"ok": True, "host": host})
+            if method == "GET" and action == "ace":
+                return self._send(200, ace_slots())
             if method == "POST" and action == "stage":
                 with LOCK:
                     return self._send(200, stage_gcode(body.get("gcode", ""), {"source": "print_lab"}))

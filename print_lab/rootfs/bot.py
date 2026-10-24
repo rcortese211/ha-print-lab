@@ -43,6 +43,25 @@ LINK_RE = re.compile(r"https?://\S+")
 # Quality presets for links, as overrides on the tuned profile (pla_08, 0.8 mm nozzle). Its
 # flow cap (15 mm3/s) sets the real speed, so these change layers, walls, infill and ironing.
 INFILLS = tuple(range(10, 101, 10))
+COLOUR_NAMES = {"black": (20, 20, 20), "white": (245, 245, 245), "grey": (128, 128, 128),
+                "red": (200, 30, 30), "orange": (240, 120, 20), "yellow": (240, 220, 40),
+                "gold": (212, 175, 55), "green": (40, 160, 60), "blue": (40, 80, 200),
+                "purple": (130, 50, 170), "pink": (240, 130, 180), "brown": (110, 70, 40),
+                "beige": (240, 200, 160), "silver": (190, 190, 195)}
+
+
+def colour_name(hexcol):
+    """#rrggbb -> the nearest plain colour name (for the bot's buttons)."""
+    try:
+        rgb = tuple(int(str(hexcol).lstrip("#")[k:k + 2], 16) for k in (0, 2, 4))
+    except ValueError:
+        return "unknown colour"
+    return min(COLOUR_NAMES, key=lambda n: sum((a - b) ** 2 for a, b in zip(COLOUR_NAMES[n], rgb)))
+
+
+def slot_label(s):
+    what = " ".join(x for x in (colour_name(s["color"]) if s.get("color") else "", s.get("name") or s.get("material") or "") if x)
+    return f"Slot {s['slot']} · {what or 'filament'}"
 INFILL_RE = re.compile(r"\d{2,3}%?")
 
 QUALITY = {
@@ -270,6 +289,16 @@ class Bot:
             except Err:
                 pass
             self.choose_quality(chat, data[2:])
+        elif data in ("c:one", "c:per") or (data.startswith("s:") and data[2:].isdigit()):
+            try:
+                self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "reply_markup": {"inline_keyboard": []}})
+            except Err:
+                pass
+            if data.startswith("c:"):
+                self.choose_colour_mode(chat, data[2:])
+            else:
+                self.choose_slot(chat, int(data[2:]))
         elif data.startswith("i:") and data[2:].isdigit():
             try:
                 self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
@@ -418,7 +447,7 @@ class Bot:
             self.tg.send(chat, "Print Lab doesn't have: " + "; ".join(missing)
                          + ("\nClose matches:\n  " + "\n  ".join(near) if near else "\nSee /files."))
             return
-        self.ask_quality(chat, items, labels)
+        self.ask_colours(chat, items, labels)
 
     def stage_links(self, chat, job):
         links, words = job
@@ -485,10 +514,74 @@ class Bot:
                 tmp.replace(dest)
             items.append({"model": fname, "count": count})
             labels.append((cand.stem, count))
-        self.ask_quality(chat, items, labels)
+        self.ask_colours(chat, items, labels)
 
-    def ask_quality(self, chat, items, labels):
-        self.pending[chat] = ("quality", (items, labels), time.time())
+    # ------------------------------------------------------------- colours
+    def ask_colours(self, chat, items, labels):
+        """Several different parts: offer one colour per part from what's loaded in the ACE."""
+        if len(items) < 2:
+            return self.ask_quality(chat, items, labels)
+        self.pending[chat] = ("colours", (items, labels), time.time())
+        self.tg.buttons(chat, f"{describe(labels)}. One colour, or a colour per part?",
+                        [[("One colour", "c:one"), ("Colour per part", "c:per")]])
+
+    def choose_colour_mode(self, chat, mode):
+        action, arg, since = self.pending.get(chat, (None, None, 0))
+        if action != "colours" or time.time() - since > CONFIRM_FOR:
+            self.tg.send(chat, "Send me a link (or /print a model) first.")
+            return
+        items, labels = arg
+        if mode == "one":
+            return self.ask_quality(chat, items, labels)
+        try:
+            slots = [s for s in (self.lab.get("/printer/ace", timeout=20) or {}).get("slots", []) if s.get("loaded")]
+        except Err as err:
+            self.tg.send(chat, f"Couldn't read the ACE ({err}), so this one prints in one colour.")
+            return self.ask_quality(chat, items, labels)
+        if not slots:
+            self.tg.send(chat, "The ACE reports no filament loaded, so this one prints in one colour.")
+            return self.ask_quality(chat, items, labels)
+        self.pending[chat] = ("slot", (items, labels, slots, []), time.time())
+        self.ask_slot(chat)
+
+    def ask_slot(self, chat):
+        _action, (items, labels, slots, picks), _since = self.pending[chat]
+        i = len(picks)
+        part, count = labels[i]
+        self.tg.buttons(chat, f"{part}" + (f" (x{count})" if count > 1 else "")
+                        + f": which slot? ({i + 1} of {len(items)})",
+                        [[(slot_label(s), f"s:{s['slot']}")] for s in slots])
+
+    def choose_slot(self, chat, slot):
+        action, arg, since = self.pending.get(chat, (None, None, 0))
+        if action != "slot" or time.time() - since > CONFIRM_FOR:
+            self.tg.send(chat, "Send me a link (or /print a model) first.")
+            return
+        items, labels, slots, picks = arg
+        by_slot = {s["slot"]: s for s in slots}
+        if slot not in by_slot:
+            self.tg.send(chat, f"Slot {slot} has nothing loaded.")
+            return
+        picks = picks + [slot]
+        if len(picks) < len(items):
+            self.pending[chat] = ("slot", (items, labels, slots, picks), time.time())
+            return self.ask_slot(chat)
+        order = list(dict.fromkeys(picks))          # colour 1 = the first slot picked, ...
+        filaments = []
+        for n in order:
+            s = by_slot[n]
+            f = {"slot": n, "color": s.get("color") or "#ffffff", "material": s.get("material") or "PLA"}
+            if s.get("temp") and 170 <= int(s["temp"]) <= 280:
+                f["temp"] = int(s["temp"])
+            filaments.append(f)
+        items = [{**it, "filament": order.index(p) + 1} for it, p in zip(items, picks)]
+        self.tg.send(chat, "Colours:\n" + "\n".join(
+            f"  {part}" + (f" x{count}" if count > 1 else "") + f" → {slot_label(by_slot[p])}"
+            for (part, count), p in zip(labels, picks)))
+        self.ask_quality(chat, items, labels, filaments)
+
+    def ask_quality(self, chat, items, labels, filaments=None):
+        self.pending[chat] = ("quality", (items, labels, filaments), time.time())
         what = describe(labels)
         pieces = sum(c for _, c in labels)
         self.tg.buttons(chat, f"{what}" + (f" ({pieces} pieces on one plate)" if pieces > 1 else "")
@@ -501,7 +594,7 @@ class Bot:
             self.tg.send(chat, "Send me a link (or /print a model) first.")
             return
         # second question: infill, 10-100 % in steps of 10
-        self.pending[chat] = ("infill", (arg[0], arg[1], key), time.time())
+        self.pending[chat] = ("infill", (arg[0], arg[1], key, arg[2] if len(arg) > 2 else None), time.time())
         self.tg.buttons(chat, f"{QUALITY[key][0]}. How much infill?",
                         [[(f"{n}%", f"i:{n}") for n in INFILLS[:5]],
                          [(f"{n}%", f"i:{n}") for n in INFILLS[5:]]])
@@ -518,7 +611,7 @@ class Bot:
         self.background(chat, self.slice_plate, (*arg, pct))
 
     def slice_plate(self, chat, job):
-        items, labels, key, infill = job
+        items, labels, key, filaments, infill = job
         label, overrides = QUALITY[key]
         name = plate_name(labels)
         self.tg.send(chat, f"Slicing {describe(labels)} ({label}, {infill}% infill, a few minutes)...")
@@ -526,7 +619,9 @@ class Bot:
         # The infill answer goes on top of either.
         body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides,
                 "overrides": {"fill_density": f"{infill}%"}}
-        if len(items) == 1 and items[0]["count"] == 1:
+        if filaments:
+            body["filaments"] = filaments
+        if len(items) == 1 and items[0]["count"] == 1 and not filaments:
             body.update({k: v for k, v in items[0].items() if k != "count"})
         else:
             body["models"] = items
@@ -539,6 +634,12 @@ class Bot:
                          + f", {infill}% infill"
                          + (" - the printer didn't answer, so that's the last nozzle it reported"
                             if s.get("nozzle_from") == "last known" else "") + ".")
+        if s.get("colours"):
+            notes.append("Colours: " + ", ".join(
+                f"slot {c['slot']} {colour_name(c['color'])} {c['material']}"
+                + (f" ({c['grams']:g} g)" if c.get("grams") else "") for c in s["colours"])
+                + (f"; {s['colour_changes']} colour change" + ("s" if s["colour_changes"] != 1 else "")
+                   + " (about 2 min each at the ACE)" if s.get("colour_changes") else "") + ".")
         for model, o in (s.get("orientation") or {}).items():
             if o.get("rotated"):
                 notes.append(f"Turned {model.rsplit('.', 1)[0]} onto its best face "
