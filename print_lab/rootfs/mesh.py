@@ -237,6 +237,8 @@ def arrange(pieces: list[np.ndarray], area=None, edge=None) -> list[np.ndarray]:
         full = area is None and edge is not None and all(
             max(size(fit_rotation(t, edge)[0])[0] - edge[0], size(fit_rotation(t, edge)[0])[1] - edge[1]) <= 0
             for t in pieces)
+        if full:
+            msg += (" (or full size" + (", one per plate," if many else "") + " using the bed edge to edge)")
         raise MeshError(msg, fit_scale=fit, separate=many, full_bed=full)
     if len(pieces) == 1:
         usable = room
