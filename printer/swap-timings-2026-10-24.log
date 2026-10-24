@@ -1,0 +1,40 @@
+[2026-10-24 08:10:08.845] INFO web/web.go:915 [_handle_script] web hook do script: UNWIND_FILAMENT ID=-1 INDEX=-1
+[2026-10-24 08:10:29.910] INFO filament/filament_hub.go:1275 [_note_cutter_state] cutter_state: 1
+[2026-10-24 08:10:31.940] INFO filament/filament_hub.go:1275 [_note_cutter_state] cutter_state: 0
+[2026-10-24 08:10:36.700] INFO filament/hub_unwind.go:38 [Cmd_UNWIND_ALL_FILAMENT] UNWIND_ALL_FILAMENT filament_tracker is filament present,extruder filament present = 1
+[2026-10-24 08:10:36.712] INFO filament/filament_hub.go:3851 [check_current_filament_by_tracker] check_current_filament_by_tracker unwind_filament 2 from extruder
+[2026-10-24 08:10:37.174] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: ready->shifting, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:10:37.760] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: shifting->unwinding, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:10:42.907] INFO filament/filament_hub.go:1281 [_note_filament_present] filament_present: 0
+[2026-10-24 08:10:59.868] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: unwinding->ready, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:10:59.868] INFO filament/hub_unwind.go:43 [Cmd_UNWIND_ALL_FILAMENT] UNWIND_ALL_FILAMENT current_filament in tracker = 2
+[2026-10-24 08:10:59.869] INFO filament/hub_unwind.go:273 [unwind_filament_to_safe_position] unwind_filament_to_safe_position filament_id=2 is_current_filament=true track
+[2026-10-24 08:11:00.411] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: ready->shifting, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:11:00.939] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: shifting->unwinding, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:11:32.883] INFO filament/filament_tracker.go:105 [_note_filament_present] filament tracker filament_present 0
+[2026-10-24 08:11:49.608] INFO filament/hub_unwind.go:426 [unwind_filament_to_safe_position] unwind_filament_to_safe_position success
+[2026-10-24 08:11:51.673] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 2 status change: unwinding->ready, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:11:52.779] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 0 status change: ready->feeding, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:12:01.655] INFO filament/filament_tracker.go:105 [_note_filament_present] filament tracker filament_present 1
+[2026-10-24 08:12:21.150] INFO filament/filament_hub.go:1281 [_note_filament_present] filament_present: 1
+[2026-10-24 08:12:31.512] INFO filament/hub_feed.go:471 [feed_filament] set_current_filament ace=0 filament=0
+[2026-10-24 08:12:32.039] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 0 status change: feeding->ready, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:14:10.920] INFO filament/filament_hub.go:2979 [extrude_filament] extrude_len:417, tracker length: 143.629689
+[2026-10-24 08:14:10.956] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 0 status change: ready->shifting, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:14:11.472] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 0 status change: shifting->unwinding, RFID: 1,Type: ,color: [0 0 0]
+[2026-10-24 08:14:12.501] INFO filament/ace_proxy.go:639 [_get_status] ace 0 get slot 0 status change: unwinding->ready, RFID: 1,Type: ,color: [0 0 0]
+
+# Summary: slot 3 -> slot 1 swap, stock behaviour, tracker working (2026-10-24 printer clock)
+# total 08:10:08 -> 08:14:12 = ~4m04s
+# prep/heat to cut 21s | cut 2s | unwind out of head 22s | unwind to safe position 51s
+# feed slot 1 40s (tracker sees it at +9s, head at +29s) | purge 98s (417mm extruded, tracker 143.6mm)
+
+# Step A result (purge changes), slot 0 -> slot 1, 08:24:49 -> 08:27:37 = ~2m48s
+# prep/heat to cut 21s | unwind out of head 23s | unwind to safe position 53s | feed 40s (tracker +9s, head +29s) | purge 20s (106mm, 253mm3, 1 step; tracker 100.7mm)
+# note: flush volume also depends on the colour pair (white->dark here); the earlier 1000mm3 had an unknown previous colour
+
+# Step B+C result (feed 60, unwind 40), slot 1 -> slot 2, 08:31:43 -> 08:34:21 = ~2m38s (bigger purge: 290mm/697mm3, 2 steps)
+# prep to cut 21s | unwind out of head 24s (unchanged) | unwind to safe 22s (was 53) | feed 24s (tracker +4s, head +14s; was 40) | purge 50s (~5.8mm/s; sweep_speed is not the purge speed)
+
+# Step E result (unwind_length_after_triggered 500), slot 2 -> slot 1. Command 08:58:58, 250C at ~08:59:04.
+# from 250C to done (09:00:51): ~1m47s | to cut 13s | unwind out of head 22s (still unchanged) | unwind to safe 15s (was 20) | feed 25s | purge 18s (106mm, known colours)

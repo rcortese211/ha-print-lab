@@ -1,0 +1,7 @@
+{
+    "$version": "1",
+    "name": "Nozzle-aware purge",
+    "description": "Reads the fitted nozzle from GoKlipper at boot and keeps the ACE purge speed in printer.custom.cfg matched to it",
+    "version": "1.0",
+    "properties": {}
+}
