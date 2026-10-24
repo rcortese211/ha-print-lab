@@ -79,6 +79,7 @@ HELP = (
     "/frames [n] - camera frames the failure check kept (every 5 min while printing + suspicious ones)\n"
     "/print <name> - put a Print Lab file on the printer\n"
     "bed 65 - hotter (or cooler) bed for the next thing you send; bed normal to undo\n"
+    "first 225 - nozzle temperature for the first layer, same way; first normal to undo\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
     "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large,\n"
@@ -235,6 +236,7 @@ class Bot:
         self.job = None            # thread doing a slice/stage
         self.plates = {}           # chat -> {"jobs": [...], "total": n}: plates still to slice
         self.bed = {}              # chat -> bed temperature for the next job (all its plates)
+        self.first = {}            # chat -> nozzle temperature for the first layer, same scope
 
     # ------------------------------------------------------------- dispatch
     def handle(self, msg):
@@ -271,6 +273,8 @@ class Bot:
                 self.tg.send(chat, "Cancelled." if self.pending.pop(chat, None) else "Nothing was waiting.")
             elif word in ("bed", "/bed"):
                 self.set_bed(chat, rest)
+            elif word in ("first", "/first", "firstlayer"):
+                self.set_first(chat, rest)
             elif word in ("next", "/next"):
                 self.next_plate(chat)
             elif word in QUALITY:
@@ -653,6 +657,9 @@ class Bot:
         bed = self.bed.get(chat)
         if bed:
             body["overrides"].update({"bed_temperature": str(bed), "first_layer_bed_temperature": str(bed)})
+        first = self.first.get(chat)
+        if first:
+            body["overrides"]["first_layer_temperature"] = str(first)
         if full:
             body["full_bed"] = True
         if len(items) == 1 and items[0]["count"] == 1 and not filaments:
@@ -690,14 +697,17 @@ class Bot:
             notes.append("Brim added: tall or small-footprint pieces hold on better with one.")
         if scale != 100:
             notes.append(f"Scaled to {scale:g}% (every part the same, so they still fit together).")
-        if bed:
-            notes.append(f"Bed at {bed} °C (you asked for it).")
+        if bed or first:
+            notes.append("You asked for: " + ", ".join(
+                x for x in (f"bed at {bed} °C" if bed else "", f"first layer at {first} °C" if first else "") if x)
+                + ".")
         if full:
             notes.append("Full size, edge to edge: no brim or skirt, and it runs right up to the bed's "
                          "edges, so check the sheet is seated square.")
         left = self.plates.get(chat, {}).get("jobs")
         if not left:
             self.bed.pop(chat, None)       # the job's done: next one is back to normal
+            self.first.pop(chat, None)
         if plate and left:
             notes.append(f"Plate {plate[0]} of {plate[1]}. When it's off the bed, send next for plate "
                          f"{plate[0] + 1}.")
@@ -723,6 +733,24 @@ class Bot:
         self.bed[chat] = temp
         self.tg.send(chat, f"Bed at {temp} °C for the next thing you send (every plate of it). "
                      "bed normal to undo.")
+
+    def set_first(self, chat, arg):
+        arg = arg.strip().lower().rstrip("c°").strip()
+        if arg in ("", "normal", "default", "off", "reset"):
+            self.first.pop(chat, None)
+            self.tg.send(chat, "First layer back to the profile's temperature (215 °C for PLA).")
+            return
+        try:
+            temp = int(float(arg))
+        except ValueError:
+            self.tg.send(chat, "first <temperature>, e.g. first 225 (or first normal)")
+            return
+        if not 180 <= temp <= 260:
+            self.tg.send(chat, "First-layer nozzle temperature goes from 180 to 260 °C.")
+            return
+        self.first[chat] = temp
+        self.tg.send(chat, f"First layer at {temp} °C on the nozzle for the next thing you send "
+                     "(every plate of it). first normal to undo.")
 
     def offer_resize(self, chat, job, err):
         """The plate doesn't fit: offer to scale it, and/or put each piece on its own plate."""

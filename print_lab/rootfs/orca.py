@@ -152,14 +152,16 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
             fil["filament_colour"] = [f["color"].upper()]
             if f.get("temp"):
                 fil["nozzle_temperature"] = [str(f["temp"])]
-                fil["nozzle_temperature_initial_layer"] = [str(f["temp"])]
+                if "nozzle_temperature_initial_layer" not in applied:   # an asked-for first layer wins
+                    fil["nozzle_temperature_initial_layer"] = [str(f["temp"])]
             fil_files.append(d / f"filament_{i}.json")
             fil_files[-1].write_text(json.dumps(fil, indent=1))
     elif filaments:
         profiles["filament"]["filament_colour"] = [filaments[0]["color"].upper()]
         if filaments[0].get("temp"):
             profiles["filament"]["nozzle_temperature"] = [str(filaments[0]["temp"])]
-            profiles["filament"]["nozzle_temperature_initial_layer"] = [str(filaments[0]["temp"])]
+            if "nozzle_temperature_initial_layer" not in applied:
+                profiles["filament"]["nozzle_temperature_initial_layer"] = [str(filaments[0]["temp"])]
     for kind, data in profiles.items():
         if kind == "filament" and len(fil_files) > 1:
             continue
