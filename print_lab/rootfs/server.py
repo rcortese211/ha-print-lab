@@ -607,7 +607,7 @@ def slice_job(req):
     if b"G9111 " not in data[:first_layer if first_layer > 0 else 2_000_000]:
         raise JobError("Sliced file is missing the Kobra start block (G9111) - wrong profile?")
     segs = plate.segments(data)
-    if segs is not None and not plate.fits(segs):
+    if segs is not None and not plate.fits(segs, area=edge_area if full_bed else None):
         lo_x, hi_x, lo_y, hi_y = plate.extents(segs)
         out.unlink(missing_ok=True)
         raise JobError(f"It doesn't fit on the bed: that layout needs about {hi_x - lo_x:.0f} x {hi_y - lo_y:.0f} mm "

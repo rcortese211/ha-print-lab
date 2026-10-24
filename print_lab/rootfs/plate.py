@@ -54,9 +54,11 @@ def extents(segs):
     return float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max())
 
 
-def fits(segs, margin=0.5):
+def fits(segs, margin=0.5, area=None):
+    """area: (x0, y0, x1, y1) allowed instead of the nominal bed (full-size plates)."""
     lo_x, hi_x, lo_y, hi_y = extents(segs)
-    return lo_x >= -margin and lo_y >= -margin and hi_x <= BED[0] + margin and hi_y <= BED[1] + margin
+    x0, y0, x1, y1 = area or (0.0, 0.0, BED[0], BED[1])
+    return lo_x >= x0 - margin and lo_y >= y0 - margin and hi_x <= x1 + margin and hi_y <= y1 + margin
 
 
 def _png(rgb: np.ndarray) -> bytes:
