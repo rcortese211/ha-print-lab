@@ -494,8 +494,17 @@ class Bot:
         out = ["Sliced (newest first):"]
         out += [f"  {g['name'][:-6]}  ({g['size'] // 1024} KB)" for g in f["gcode"][:25]] or ["  none"]
         out.append("Models:")
-        out += [f"  {m['name']}" for m in f["models"][:25]] or ["  none"]
-        out.append("\n/print <name> to put one on the printer.")
+        loose = [m for m in f["models"] if "/" not in m["name"]]
+        folders = {}
+        for m in f["models"]:
+            if "/" in m["name"]:
+                folders.setdefault(m["name"].split("/", 1)[0], []).append(m["name"].split("/", 1)[1])
+        for folder, names in list(folders.items())[:15]:
+            out.append(f"  {folder}/  " + ", ".join(names[:8]) + (f" +{len(names) - 8} more" if len(names) > 8 else ""))
+        out += [f"  {m['name']}" for m in loose[:20]]
+        if not f["models"]:
+            out.append("  none")
+        out.append("\n/print <name> to put one on the printer; /print <folder> for a whole project.")
         self.tg.send(chat, "\n".join(out))
 
     def stage_name(self, chat, text):
@@ -503,9 +512,19 @@ class Bot:
         entries = parse_entries(text)
         f = self.lab_files()
         gcode = {g["name"][:-6].lower(): g["name"] for g in f["gcode"]}
+        # a model can be named in full ("lamp/part1.stl"), without its extension, or by its bare
+        # file name (the newest one wins when two projects share a name); a folder means all of it
         models = {m["name"].lower(): m["name"] for m in f["models"]}
         for m in f["models"]:
             models.setdefault(m["name"].rsplit(".", 1)[0].lower(), m["name"])
+        for m in f["models"]:
+            base = m["name"].rsplit("/", 1)[-1]
+            models.setdefault(base.lower(), m["name"])
+            models.setdefault(base.rsplit(".", 1)[0].lower(), m["name"])
+        folders = {}
+        for m in f["models"]:
+            if "/" in m["name"]:
+                folders.setdefault(m["name"].split("/", 1)[0].lower(), []).append(m["name"])
         if len(entries) == 1 and entries[0][1] == 1:
             key = re.sub(r"\.gcode$", "", entries[0][0], flags=re.I).lower()
             if key in gcode:
@@ -517,14 +536,19 @@ class Bot:
                 return
         items, labels, missing = [], [], []
         for name, count in entries:
-            key = name.lower()
+            key = name.lower().rstrip("/")
+            if key in folders and key not in models:
+                for model in sorted(folders[key]):
+                    items.append({"model": model, "count": count})
+                    labels.append((model.rsplit("/", 1)[-1].rsplit(".", 1)[0], count))
+                continue
             model = models.get(key) or models.get(re.sub(r"\.(stl|3mf|obj|step|stp|scad)$", "", key))
             if not model:
                 missing.append(name + (" (only sliced G-code, which can't share a plate)"
                                        if key.removesuffix(".gcode") in gcode else ""))
                 continue
             items.append({"model": model, "count": count})
-            labels.append((model.rsplit(".", 1)[0], count))
+            labels.append((model.rsplit("/", 1)[-1].rsplit(".", 1)[0], count))
         if missing:
             near = [n for n in models.values() if any(m.split()[0].lower() in n.lower() for m in missing)][:8]
             self.tg.send(chat, "Print Lab doesn't have: " + "; ".join(missing)
@@ -539,6 +563,8 @@ class Bot:
         if len(links) == 1:
             url, count = links[0]
             title, cands = sources.resolve(url)
+            for c in cands:
+                c.project = title
             return self.choose_candidates(chat, title, cands, words, archive, count)
         picked, problems = [], []
         for n, (url, count) in enumerate(links, 1):
@@ -547,6 +573,8 @@ class Bot:
             except sources.SourceError as err:
                 problems.append(f"link {n}: {err}")
                 continue
+            for c in cands:
+                c.project = _title
             if len(cands) == 1:
                 picked.append((cands[0], count))
             else:
@@ -600,22 +628,29 @@ class Bot:
         for cand, count in picked:
             ext = os.path.splitext(cand.name)[1].lower()
             fname = safe_name(cand.stem) + ext
-            dest = models / fname
+            # one folder per project (the link's title, the zip's name...), so a part1.stl from one
+            # model never replaces another's
+            folder = safe_name(getattr(cand, "project", None) or cand.stem)[:40]
+            (models / folder).mkdir(exist_ok=True)
+            dest = models / folder / fname
             if not dest.is_file() or (cand.size and dest.stat().st_size != cand.size):
                 data = cand.get()
                 if not data:
                     raise Err(f"{cand.name} downloaded empty")
-                tmp = models / f".{fname}.part"
+                tmp = models / folder / f".{fname}.part"
                 tmp.write_bytes(data)
                 tmp.replace(dest)
-            items.append({"model": fname, "count": count})
+            items.append({"model": f"{folder}/{fname}", "count": count})
             labels.append((cand.stem, count))
         if archive:
             names = list(dict.fromkeys(i["model"] for i in items))
+            folders = list(dict.fromkeys(n.split("/", 1)[0] for n in names))
             self.tg.send(chat, f"Saved {len(names)} file" + ("s" if len(names) != 1 else "")
-                         + " to the models drive, not sliced:\n  " + "\n  ".join(names)
-                         + "\n\nTo print later: /print " + names[0].rsplit(".", 1)[0]
-                         + (" (or several: /print a, b x2)" if len(names) > 1 else ""))
+                         + f" to the models drive in {', '.join(f + '/' for f in folders)}, not sliced:\n  "
+                         + "\n  ".join(names)
+                         + "\n\nTo print later: /print " + (folders[0] if len(names) > 1 else names[0].rsplit(".", 1)[0])
+                         + (" for the lot, or /print " + names[0].rsplit(".", 1)[0] + " for one"
+                            if len(names) > 1 and len(folders) == 1 else ""))
             return
         self.ask_colours(chat, items, labels)
 
@@ -663,9 +698,13 @@ class Bot:
                 inside = sources._zip_candidates(data)
                 if not inside:
                     raise Err(f"{name} has no model files in it (STL, 3MF, OBJ or STEP)")
+                for c in inside:
+                    c.project = os.path.splitext(name)[0]
                 cands += inside
             else:
-                cands.append(sources.Candidate(name, len(data), lambda d=data: d))
+                c = sources.Candidate(name, len(data), lambda d=data: d)
+                c.project = os.path.splitext(entries[0][1])[0]     # files sent together share a folder
+                cands.append(c)
             if caption:
                 words.append(caption)
         title = entries[0][1] if len(entries) == 1 else f"those {len(entries)} files"

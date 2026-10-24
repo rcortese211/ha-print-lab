@@ -387,9 +387,14 @@ def model_input(item, fallback_name):
         stem = re.sub(r"[^A-Za-z0-9_-]+", "_", urllib.parse.unquote(stem)).strip("_-")[:50] or fallback_name
         model = fetch(url, stem)
     elif item.get("model"):
-        model = MODELS / Path(str(item["model"])).name
+        # "file.stl" or "project/file.stl" (one folder per project, as the bot saves them)
+        parts = [p for p in str(item["model"]).replace("\\", "/").split("/") if p]
+        if not 1 <= len(parts) <= 2 or any(p in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_. -]{1,120}", p)
+                                           for p in parts):
+            raise JobError(f"{item['model']} isn't a model name I can use")
+        model = MODELS.joinpath(*parts)
         if not model.is_file():
-            raise JobError(f"{model.name} is not in printlab/models")
+            raise JobError(f"{'/'.join(parts)} is not in printlab/models")
     else:
         raise JobError("Each model needs a url or a model name")
     if model.suffix == ".scad":
@@ -872,11 +877,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, raw=f.read_bytes(), ctype="image/jpeg")
             return self._send(404, {"error": "not found"})
         if path == "/files":
-            def ls(folder, exts):
-                rows = [{"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
-                        for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
+            def ls(folder, exts, depth=0):
+                """Files in folder; with depth=1 also one level of project folders ("project/file")."""
+                rows = []
+                for p in folder.iterdir():
+                    if p.name.startswith("."):
+                        continue
+                    if p.is_file() and p.suffix.lower() in exts:
+                        rows.append({"name": p.name, "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)})
+                    elif p.is_dir() and depth:
+                        rows += [dict(r, name=f"{p.name}/{r['name']}", folder=p.name) for r in ls(p, exts)]
                 return sorted(rows, key=lambda r: -r["mtime"])
-            return self._send(200, {"models": ls(MODELS, MODEL_EXT), "gcode": ls(GCODE, (".gcode",))})
+            return self._send(200, {"models": ls(MODELS, MODEL_EXT, depth=1), "gcode": ls(GCODE, (".gcode",))})
         if path == "/watch/last.jpg" and (DETECTOR.dir / "last.jpg").is_file():
             return self._send(200, raw=(DETECTOR.dir / "last.jpg").read_bytes(), ctype="image/jpeg")
         m = re.fullmatch(r"/preview/([A-Za-z0-9_-]{1,60})\.png", path)
