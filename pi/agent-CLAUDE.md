@@ -21,8 +21,11 @@ chat, which is fine, but keep anything written to files or external places clean
   (`/config/custom_components/kobra_print`, settings in `/config/kobra_print/lab.json`).
 
 ## Slicing
-- OrcaSlicer 2.4.2 (`/opt/orcaslicer`) is the default slicer: Anycubic's own Kobra S1 profiles adapted
-  to the 0.8 mm nozzle, in `print_lab/rootfs/profiles/orca/` (rebuild with `tools/orca_profiles/build.py`).
+- OrcaSlicer 2.4.2 (`/opt/orcaslicer`) is the default slicer: Anycubic's own Kobra S1 profiles, one set
+  per nozzle in `print_lab/rootfs/profiles/orca/<0.4|0.8>/` (rebuild with `tools/orca_profiles/build.py`).
+  Print Lab reads the fitted nozzle from Moonraker (`extruder.Nozzle_diameter`, set on the touchscreen)
+  before every slice, remembers the last answer in /var/lib/printlab/nozzle.json, and refuses nozzles
+  with no profile. Requests can force one with `nozzle: 0.4`.
   It beat the old PrusaSlicer profile clearly on a 20 mm test cube (Oct 2026). PrusaSlicer is still
   installed; `/slice` takes `slicer: prusa` to use it.
 - Rinkhals (custom firmware, Moonraker on :7125, Fluidd on :4409) is installed on the printer. The camera

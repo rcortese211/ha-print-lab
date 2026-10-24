@@ -1,5 +1,5 @@
-"""OrcaSlicer engine: Anycubic's own Kobra S1 profiles (built for the 0.8 mm nozzle by
-tools/orca_profiles/build.py) sliced headless with the Orca CLI.
+"""OrcaSlicer engine: Anycubic's own Kobra S1 profiles, one set per nozzle size (built by
+tools/orca_profiles/build.py into profiles/orca/<nozzle>/), sliced headless with the Orca CLI.
 
 Overrides use PrusaSlicer's key names (what the bot, HA and older callers send); they are
 translated here to Orca's keys and written into copies of the three profile files.
@@ -19,13 +19,38 @@ class OrcaError(Exception):
     pass
 
 
-def available() -> bool:
-    return ORCA.is_file() and (PROFILE_DIR / "machine.json").is_file()
+def nozzle_key(nozzle) -> str:
+    """0.4, "0.40", 0.4000001 -> "0.4"."""
+    return f"{float(nozzle):.1f}"
 
 
-def retraction_length() -> float:
-    v = json.loads((PROFILE_DIR / "machine.json").read_text()).get("retraction_length", ["0"])
-    return float(v[0] if isinstance(v, list) else v)
+def supported_nozzles() -> list[str]:
+    if not PROFILE_DIR.is_dir():
+        return []
+    return sorted(d.name for d in PROFILE_DIR.iterdir() if (d / "machine.json").is_file())
+
+
+def profile_dir(nozzle) -> Path:
+    d = PROFILE_DIR / nozzle_key(nozzle)
+    if not (d / "machine.json").is_file():
+        have = ", ".join(f"{n} mm" for n in supported_nozzles()) or "none"
+        raise OrcaError(f"No Print Lab profile for a {nozzle_key(nozzle)} mm nozzle yet (have: {have})")
+    return d
+
+
+def available(nozzle=None) -> bool:
+    if not ORCA.is_file():
+        return False
+    return bool(supported_nozzles()) if nozzle is None else nozzle_key(nozzle) in supported_nozzles()
+
+
+def _first(v):
+    return v[0] if isinstance(v, list) else v
+
+
+def retraction_length(nozzle) -> float:
+    return float(_first(json.loads((profile_dir(nozzle) / "machine.json").read_text())
+                        .get("retraction_length", ["0"])))
 
 
 def _onoff(v):
@@ -59,13 +84,16 @@ KEYS = {
 }
 
 
-def quality_for(overrides: dict) -> str:
-    """Older callers pick quality by layer height; map that onto Anycubic's three processes."""
+def quality_for(overrides: dict, nozzle) -> str:
+    """Older callers pick quality by layer height: take the process with the nearest one."""
+    d = profile_dir(nozzle)
+    heights = {q: float(_first(json.loads((d / f"process_{q}.json").read_text())["layer_height"]))
+               for q in QUALITIES}
     try:
-        lh = float(overrides.get("layer_height", 0.32))
-    except ValueError:
-        lh = 0.32
-    return "fast" if lh >= 0.44 else "high" if lh <= 0.27 else "medium"
+        lh = float(overrides["layer_height"])
+    except (KeyError, ValueError):
+        return "medium"
+    return min(heights, key=lambda q: abs(heights[q] - lh))
 
 
 def _set(profiles: dict, key: str, value: str) -> None:
@@ -78,13 +106,15 @@ def _set(profiles: dict, key: str, value: str) -> None:
 
 
 def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str,
-                overrides: dict, out: Path, work: Path, timeout: int = 1800) -> dict:
-    """Slice inputs (one object per file) into out. Returns Orca's result summary."""
+                overrides: dict, out: Path, work: Path, nozzle, timeout: int = 1800) -> dict:
+    """Slice inputs (one object per file) into out with the profiles for this nozzle.
+    Returns Orca's result summary."""
     if quality not in QUALITIES:
         raise OrcaError(f"quality must be one of {', '.join(QUALITIES)}")
-    profiles = {"machine": json.loads((PROFILE_DIR / "machine.json").read_text()),
-                "process": json.loads((PROFILE_DIR / f"process_{quality}.json").read_text()),
-                "filament": json.loads((PROFILE_DIR / "filament_pla.json").read_text())}
+    pdir = profile_dir(nozzle)
+    profiles = {"machine": json.loads((pdir / "machine.json").read_text()),
+                "process": json.loads((pdir / f"process_{quality}.json").read_text()),
+                "filament": json.loads((pdir / "filament_pla.json").read_text())}
     applied = {}
     for k, v in overrides.items():
         ok, conv = KEYS.get(k, (k, str))
@@ -94,7 +124,7 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
         if k == "brim_width":
             _set(profiles, "brim_type", "outer_only" if float(v) > 0 else "no_brim")
     if profiles["process"].get("enable_support") == "1":
-        # an 0.8 mm line can't make tree-support tips; Anycubic's own default is normal
+        # grid supports: tree tips are too fine for the big nozzles, and it's Anycubic's default
         profiles["process"].setdefault("support_style", "grid")
 
     d = work / f"{name}.orca"
@@ -120,4 +150,6 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
         raise OrcaError(f"OrcaSlicer couldn't slice it: {msg or 'no message'}")
     shutil.move(str(gcode), out)
     warn = "; ".join(w for w in (pl.get("warning_message") for pl in result.get("sliced_plates", [])) if w)
-    return {"quality": quality, "overrides_applied": applied, "warnings": warn}
+    return {"quality": quality, "nozzle": nozzle_key(nozzle),
+            "layer_height": _first(profiles["process"].get("layer_height")),
+            "overrides_applied": applied, "warnings": warn}

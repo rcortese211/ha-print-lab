@@ -533,6 +533,12 @@ class Bot:
         r = self.lab.post("/slice", body, timeout=1800) or {}
         s = r.get("sliced") or {}
         notes = []
+        if s.get("nozzle"):
+            lh = (s.get("orca") or {}).get("layer_height")
+            notes.append(f"{s['nozzle']} mm nozzle, {label.lower()}" + (f" ({lh} mm layers)" if lh else "")
+                         + f", {infill}% infill"
+                         + (" - the printer didn't answer, so that's the last nozzle it reported"
+                            if s.get("nozzle_from") == "last known" else "") + ".")
         for model, o in (s.get("orientation") or {}).items():
             if o.get("rotated"):
                 notes.append(f"Turned {model.rsplit('.', 1)[0]} onto its best face "

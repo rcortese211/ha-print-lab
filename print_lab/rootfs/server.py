@@ -71,6 +71,29 @@ def printer():
     return _PRINTER
 
 
+NOZZLE_CACHE = LAB / "nozzle.json"
+
+
+def fitted_nozzle():
+    """The nozzle the printer says is fitted (Rinkhals' Moonraker: extruder.Nozzle_diameter, set
+    on the touchscreen), as "0.4"/"0.8". Remembers the last answer for when the printer is off or
+    busy; returns (nozzle or None, where it came from)."""
+    try:
+        host = json.loads(PRINTER_CFG.read_text()).get("host")
+        with urllib.request.urlopen(f"http://{host}:7125/printer/objects/query?extruder", timeout=4) as r:
+            value = json.load(r)["result"]["status"]["extruder"].get("Nozzle_diameter")
+        if value:
+            nozzle = f"{float(value):.1f}"
+            NOZZLE_CACHE.write_text(json.dumps({"nozzle": nozzle, "at": time.strftime("%Y-%m-%d %H:%M:%S")}))
+            return nozzle, "printer"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return json.loads(NOZZLE_CACHE.read_text())["nozzle"], "last known"
+    except (OSError, ValueError, KeyError):
+        return None, None
+
+
 def read_staged():
     try:
         return json.loads(STAGED.read_text())
@@ -303,6 +326,19 @@ def slice_job(req):
         raise JobError("slicer must be prusa or orca")
     if engine == "orca" and not orca.available():
         raise JobError("OrcaSlicer isn't installed on the Pi")
+    # the profile has to match the nozzle actually fitted (0.8 lines on a 0.4 nozzle print badly)
+    if req.get("nozzle"):
+        nozzle, nozzle_from = f"{float(req['nozzle']):.1f}", "request"
+    else:
+        nozzle, nozzle_from = fitted_nozzle()
+    if nozzle is None:
+        raise JobError("Couldn't tell which nozzle is fitted (the printer didn't answer). "
+                       "Set it on the printer's screen, or pass nozzle: 0.4 or 0.8")
+    if engine == "orca" and not orca.available(nozzle):
+        raise JobError(f"No Print Lab profile for a {nozzle} mm nozzle yet "
+                       f"(have: {', '.join(n + ' mm' for n in orca.supported_nozzles())})")
+    if engine == "prusa" and nozzle != "0.8":
+        raise JobError(f"The PrusaSlicer profile is for the 0.8 mm nozzle; the printer has a {nozzle} mm one")
     profile = str(req.get("profile", "pla_08"))
     if engine == "prusa" and (not NAME_RE.fullmatch(profile) or not (PROFILES / f"{profile}.ini").is_file()):
         raise JobError(f"Unknown profile '{profile}'")
@@ -397,7 +433,8 @@ def slice_job(req):
     if engine == "orca":
         try:
             orca_info = orca.slice_files(name, inputs, layout == ["--dont-arrange"],
-                                         quality or orca.quality_for(overrides), overrides, out, WORK)
+                                         quality or orca.quality_for(overrides, nozzle), overrides,
+                                         out, WORK, nozzle)
         except (orca.OrcaError, subprocess.TimeoutExpired, ValueError) as err:
             raise JobError(f"{err}" + (f" (orientation: {json.dumps(orientation)})" if orientation else "")) from err
     else:
@@ -444,7 +481,7 @@ def slice_job(req):
         data, applied = apply_temps(data, tune["temps"])
     if tune.get("retracts"):
         base = float((req.get("overrides") or {}).get("retract_length")
-                     or (orca.retraction_length() if engine == "orca"
+                     or (orca.retraction_length(nozzle) if engine == "orca"
                          else profile_value(profile, "retract_length")) or 0)
         data, retracts_applied = apply_retracts(data, tune["retracts"], base)
     if tune.get("camera_calibration"):
@@ -462,8 +499,8 @@ def slice_job(req):
     return {"gcode": out.name, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
             "estimated_time": grab("estimated printing time (normal mode)"),
             "filament_g": grab("filament used [g]"),
-            "profile": profile if engine == "prusa" else f"orca {orca_info['quality']}",
-            "slicer": engine, "orca": orca_info,
+            "profile": profile if engine == "prusa" else f"orca {orca_info['quality']} ({nozzle} mm nozzle)",
+            "slicer": engine, "orca": orca_info, "nozzle": nozzle, "nozzle_from": nozzle_from,
             "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
             "supports": overrides.get("support_material") == "1",
             "brim": float(overrides.get("brim_width") or 0) > 0,
@@ -600,6 +637,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self._body(64 * 1024) or b"{}") if method == "POST" else {}
             if method == "GET" and action == "status":
                 return self._send(200, {**printer().status(), "camera": printer().stream_url,
+                                        "nozzle": fitted_nozzle()[0],
                                         "staged": read_staged() or None})
             if method == "GET" and action == "calibration":
                 _p, cal = calib.load(CALIBRATION)
