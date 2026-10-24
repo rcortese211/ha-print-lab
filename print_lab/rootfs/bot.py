@@ -39,6 +39,7 @@ LAB_URL = os.environ.get("PRINTLAB_URL", "http://127.0.0.1:8099")
 MODEL_EXT = (".stl", ".3mf", ".obj", ".step", ".stp")
 TOKEN = os.environ.get("PRINTLAB_ADMIN_TOKEN", "")
 CONFIRM_FOR = 15 * 60
+STATE = LAB / "bot_state.json"     # queued plates and per-job temperatures, kept across restarts
 LINK_RE = re.compile(r"https?://\S+")
 # Quality presets for links, as overrides on the tuned profile (pla_08, 0.8 mm nozzle). Its
 # flow cap (15 mm3/s) sets the real speed, so these change layers, walls, infill and ironing.
@@ -237,6 +238,23 @@ class Bot:
         self.plates = {}           # chat -> {"jobs": [...], "total": n}: plates still to slice
         self.bed = {}              # chat -> bed temperature for the next job (all its plates)
         self.first = {}            # chat -> nozzle temperature for the first layer, same scope
+        self.load_state()
+
+    def load_state(self):
+        try:
+            st = json.loads(STATE.read_text())
+        except (OSError, ValueError):
+            return
+        for key in ("plates", "bed", "first"):
+            getattr(self, key).update({int(c): v for c, v in (st.get(key) or {}).items()})
+
+    def save_state(self):
+        try:
+            tmp = STATE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"plates": self.plates, "bed": self.bed, "first": self.first}))
+            tmp.replace(STATE)
+        except OSError as err:
+            log("couldn't save bot state:", err)
 
     # ------------------------------------------------------------- dispatch
     def handle(self, msg):
@@ -323,6 +341,13 @@ class Bot:
             except Err:
                 pass
             self.choose_resize(chat, data[2:])
+        elif data.startswith("o:") and data[2:].isdigit():
+            try:
+                self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "reply_markup": {"inline_keyboard": []}})
+            except Err:
+                pass
+            self.choose_order(chat, int(data[2:]))
         elif data.startswith("i:") and data[2:].isdigit():
             try:
                 self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
@@ -708,6 +733,7 @@ class Bot:
         if not left:
             self.bed.pop(chat, None)       # the job's done: next one is back to normal
             self.first.pop(chat, None)
+            self.save_state()
         if plate and left:
             notes.append(f"Plate {plate[0]} of {plate[1]}. When it's off the bed, send next for plate "
                          f"{plate[0] + 1}.")
@@ -720,6 +746,7 @@ class Bot:
         arg = arg.strip().lower().rstrip("c°").strip()
         if arg in ("", "normal", "default", "off", "reset"):
             self.bed.pop(chat, None)
+            self.save_state()
             self.tg.send(chat, "Bed back to the profile's temperature (55 °C for PLA).")
             return
         try:
@@ -731,6 +758,7 @@ class Bot:
             self.tg.send(chat, "Bed temperature goes from 40 to 100 °C.")
             return
         self.bed[chat] = temp
+        self.save_state()
         self.tg.send(chat, f"Bed at {temp} °C for the next thing you send (every plate of it). "
                      "bed normal to undo.")
 
@@ -738,6 +766,7 @@ class Bot:
         arg = arg.strip().lower().rstrip("c°").strip()
         if arg in ("", "normal", "default", "off", "reset"):
             self.first.pop(chat, None)
+            self.save_state()
             self.tg.send(chat, "First layer back to the profile's temperature (215 °C for PLA).")
             return
         try:
@@ -749,6 +778,7 @@ class Bot:
             self.tg.send(chat, "First-layer nozzle temperature goes from 180 to 260 °C.")
             return
         self.first[chat] = temp
+        self.save_state()
         self.tg.send(chat, f"First layer at {temp} °C on the nozzle for the next thing you send "
                      "(every plate of it). first normal to undo.")
 
@@ -800,22 +830,59 @@ class Bot:
             for _ in range(int(item.get("count") or count or 1)):
                 jobs.append(([dict(one, count=1)], [(lab, 1)], key, fil, infill, scale, full))
         self.plates[chat] = {"jobs": jobs, "total": len(jobs), "next": 1}
+        self.save_state()
         self.next_plate(chat)
 
     def next_plate(self, chat):
+        """Slice the next plate; when more than one is left, ask which goes next."""
         q = self.plates.get(chat)
         if not q or not q["jobs"]:
             self.plates.pop(chat, None)
+            self.save_state()
             self.tg.send(chat, "No more plates waiting.")
             return
-        job = q["jobs"].pop(0)
-        n = q["next"]
+        if len(q["jobs"]) == 1:
+            self.run_plate(chat, 0)
+            return
+        self.pending[chat] = ("order", None, time.time())
+        names = [describe(j[1]) for j in q["jobs"]]
+        seen = {}
+        rows = []
+        for i, n in enumerate(names):
+            seen[n] = seen.get(n, 0) + 1
+            label = n + (f" (copy {seen[n]})" if names.count(n) > 1 else "")
+            rows.append([(label, f"o:{i}")])
+        self.tg.buttons(chat, f"Plate {q['next']} of {q['total']}: which one should I print "
+                        + ("first?" if q["next"] == 1 else "next?"), rows)
+
+    def choose_order(self, chat, i):
+        action, _arg, _since = self.pending.get(chat, (None, None, 0))
+        q = self.plates.get(chat)
+        if action != "order" or not q or not 0 <= i < len(q["jobs"]):
+            self.tg.send(chat, "That choice ran out; send next to pick again.")
+            return
+        del self.pending[chat]
+        self.run_plate(chat, i)
+
+    def run_plate(self, chat, i):
+        q = self.plates[chat]
+        job = q["jobs"].pop(i)
+        n, total = q["next"], q["total"]
         q["next"] += 1
         if not q["jobs"]:
             self.plates.pop(chat, None)
+        self.save_state()
 
         def run(chat, job):
-            self.slice_plate(chat, job, plate=(n, q["total"]))
+            try:
+                self.slice_plate(chat, job, plate=(n, total))
+            except Exception:
+                # keep it queued (e.g. the printer was still busy): send next to try again
+                q2 = self.plates.setdefault(chat, {"jobs": [], "total": total, "next": n})
+                q2["jobs"].insert(0, job)
+                q2["next"] = min(q2["next"], n)
+                self.save_state()
+                raise
 
         self.background(chat, run, job)
 
