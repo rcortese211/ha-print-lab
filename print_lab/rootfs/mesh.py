@@ -25,10 +25,11 @@ class MeshError(Exception):
     """fit_scale: the biggest scale (%) at which every piece fits the bed on a plate of its own;
     separate: the pieces fit one at a time but not together."""
 
-    def __init__(self, msg, fit_scale=None, separate=False):
+    def __init__(self, msg, fit_scale=None, separate=False, full_bed=False):
         super().__init__(msg)
         self.fit_scale = fit_scale
         self.separate = separate
+        self.full_bed = full_bed      # every piece fits alone if the whole bed (edge to edge) is used
 
 
 # --------------------------------------------------------------------------- reading
@@ -198,13 +199,17 @@ def size(t: np.ndarray) -> tuple[float, float, float]:
     return float(w), float(d), float(h)
 
 
-def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
+def arrange(pieces: list[np.ndarray], area=None, edge=None) -> list[np.ndarray]:
     """Shelf-pack the pieces' footprints onto the bed, centred as a group. Raises if they don't fit.
     A piece too big for the bed is turned about Z if some angle fits; a plate of one piece may use
-    the bed up to SOLO_MARGIN from the edge."""
+    the bed up to SOLO_MARGIN from the edge.
+    area: (x0, y0, x1, y1) to use instead, edge to edge with no margin (a plate Robbie asked to
+    print full size). edge: that area's (w, d), only to say in the error whether it would fit."""
     usable = (BED[0] - 2 * MARGIN, BED[1] - 2 * MARGIN)
     solo = (BED[0] - 2 * SOLO_MARGIN, BED[1] - 2 * SOLO_MARGIN)
     room = usable if len(pieces) > 1 else solo
+    if area is not None:
+        usable = solo = room = (area[2] - area[0], area[3] - area[1])
     sized = []
     turned = {}
     for i, t in enumerate(pieces):
@@ -229,7 +234,10 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
         else:
             msg = (f"one piece is {w:.0f} x {d:.0f} mm, too big to share the bed; "
                    "each piece fits on a plate of its own")
-        raise MeshError(msg, fit_scale=fit, separate=many)
+        full = area is None and edge is not None and all(
+            max(size(fit_rotation(t, edge)[0])[0] - edge[0], size(fit_rotation(t, edge)[0])[1] - edge[1]) <= 0
+            for t in pieces)
+        raise MeshError(msg, fit_scale=fit, separate=many, full_bed=full)
     if len(pieces) == 1:
         usable = room
     sized.sort(key=lambda s: (-s[3], -s[2]))                  # tallest footprint (Y) first
@@ -246,7 +254,10 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
         raise MeshError(f"the pieces need about {width:.0f} x {depth:.0f} mm laid out and don't fit "
                         f"together on the {BED[0]:.0f} x {BED[1]:.0f} mm bed; print them on separate plates",
                         separate=True)
-    ox, oy = (BED[0] - width) / 2, (BED[1] - depth) / 2
+    if area is not None:
+        ox, oy = (area[0] + area[2] - width) / 2, (area[1] + area[3] - depth) / 2
+    else:
+        ox, oy = (BED[0] - width) / 2, (BED[1] - depth) / 2
     return [placed[i][0] + [placed[i][1] + ox, placed[i][2] + oy, 0] for i in range(len(pieces))]
 
 

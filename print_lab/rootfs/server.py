@@ -94,6 +94,29 @@ def fitted_nozzle():
         return None, None
 
 
+EDGE_SLACK = 3.0      # mm past the nominal 250 x 250 a full-bed plate may use, within the travel
+
+
+def full_bed_area():
+    """(x0, y0, x1, y1) a full-bed plate may use: the printer's own travel limits (Moonraker
+    toolhead axis_minimum/maximum), no more than EDGE_SLACK past the nominal bed. None if unknown."""
+    try:
+        host = json.loads(PRINTER_CFG.read_text()).get("host")
+        with urllib.request.urlopen(f"http://{host}:7125/printer/objects/query?toolhead", timeout=4) as r:
+            th = json.load(r)["result"]["status"]["toolhead"]
+        lo, hi = th["axis_minimum"], th["axis_maximum"]
+        area = (max(float(lo[0]), -EDGE_SLACK), max(float(lo[1]), -EDGE_SLACK),
+                min(float(hi[0]), mesh.BED[0] + EDGE_SLACK), min(float(hi[1]), mesh.BED[1] + EDGE_SLACK))
+        cache = LAB / "bed_area.json"
+        cache.write_text(json.dumps(area))
+        return area
+    except Exception:  # noqa: BLE001
+        try:
+            return tuple(json.loads((LAB / "bed_area.json").read_text()))
+        except (OSError, ValueError):
+            return None
+
+
 HEX_RE = re.compile(r"#?([0-9a-fA-F]{6})")
 
 
@@ -478,7 +501,14 @@ def slice_job(req):
         raise JobError("scale must be between 10 and 400 (%)")
     if scale != 100 and not readable:
         raise JobError("Only STL, 3MF and OBJ models can be scaled")
-    if readable and (pieces > 1 or scale != 100
+    # full_bed: use the bed edge to edge (no skirt margin), as far as the printer's travel allows
+    full_bed = bool(req.get("full_bed"))
+    edge_area = full_bed_area() if readable else None
+    if full_bed and edge_area is None:
+        raise JobError("Couldn't read the printer's travel limits, so I won't print edge to edge")
+    if full_bed and engine != "orca":
+        raise JobError("Edge-to-edge plates need OrcaSlicer")
+    if readable and (pieces > 1 or scale != 100 or full_bed
                      or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
         try:
             meshes = {}
@@ -489,7 +519,9 @@ def slice_job(req):
                     orientation[Path(p).name] = info
                     supports |= info["needs_supports"]
                 meshes[p] = tris
-            laid = mesh.arrange([meshes[p] for p in inputs])
+            laid = mesh.arrange([meshes[p] for p in inputs], area=edge_area if full_bed else None,
+                                edge=(edge_area[2] - edge_area[0], edge_area[3] - edge_area[1])
+                                if edge_area else None)
             # tall or tiny footprints (chess pieces, keycaps): a brim keeps them on the bed
             for part in laid:
                 lo, hi = part.reshape(-1, 3).min(0), part.reshape(-1, 3).max(0)
@@ -497,7 +529,8 @@ def slice_job(req):
                 if h > 1.5 * min(w, d) or w * d < 400:
                     needs_brim = True
         except mesh.MeshError as err:
-            extra = {k: v for k, v in (("fit_scale", err.fit_scale), ("separate", err.separate)) if v}
+            extra = {k: v for k, v in (("fit_scale", err.fit_scale), ("separate", err.separate),
+                                       ("full_bed", err.full_bed)) if v}
             raise JobError(f"Couldn't lay out the plate: {err}", **extra) from err
         if engine == "orca":
             # one file per piece, kept where we laid it: Orca makes each its own object, so a
@@ -528,7 +561,7 @@ def slice_job(req):
         # grid supports: the organic style's tips can't be thinner than a 0.8 mm nozzle's line
         overrides.update({"support_material": "1", "support_material_auto": "1",
                           "support_material_style": "grid"})
-    if needs_brim and "brim_width" not in overrides:
+    if needs_brim and not full_bed and "brim_width" not in overrides:
         overrides["brim_width"] = "5"
     for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
@@ -540,7 +573,8 @@ def slice_job(req):
             orca_info = orca.slice_files(name, inputs, layout == ["--dont-arrange"],
                                          quality or orca.quality_for(overrides, nozzle), overrides,
                                          out, WORK, nozzle, filaments=filaments or None,
-                                         filament_ids=piece_filament if filaments else None)
+                                         filament_ids=piece_filament if filaments else None,
+                                         bed_area=edge_area if full_bed else None)
         except (orca.OrcaError, subprocess.TimeoutExpired, ValueError) as err:
             raise JobError(f"{err}" + (f" (orientation: {json.dumps(orientation)})" if orientation else "")) from err
     else:
@@ -622,7 +656,7 @@ def slice_job(req):
                 grab("filament used [g]")),
             "profile": profile if engine == "prusa" else f"orca {orca_info['quality']} ({nozzle} mm nozzle)",
             "slicer": engine, "orca": orca_info, "nozzle": nozzle, "nozzle_from": nozzle_from,
-            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "scale": scale, "orientation": orientation,
+            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "scale": scale, "full_bed": full_bed, "orientation": orientation,
             "supports": overrides.get("support_material") == "1",
             "brim": float(overrides.get("brim_width") or 0) > 0,
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,

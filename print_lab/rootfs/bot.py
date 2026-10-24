@@ -308,7 +308,7 @@ class Bot:
                 self.choose_colour_mode(chat, data[2:])
             else:
                 self.choose_slot(chat, int(data[2:]))
-        elif data in ("z:scale", "z:split"):
+        elif data in ("z:scale", "z:split", "z:full", "z:fullsplit"):
             try:
                 self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
                                                        "reply_markup": {"inline_keyboard": []}})
@@ -627,15 +627,17 @@ class Bot:
         self.background(chat, self.slice_plate, (*arg, pct))
 
     def slice_plate(self, chat, job, plate=None):
-        """job: (items, labels, quality key, filaments, infill[, scale %]).
+        """job: (items, labels, quality key, filaments, infill[, scale %[, full bed]]).
         plate: (n, total) when it's one of several plates."""
         items, labels, key, filaments, infill = job[:5]
         scale = job[5] if len(job) > 5 else 100
+        full = bool(job[6]) if len(job) > 6 else False
         label, overrides = QUALITY[key]
-        name = plate_name(labels) + (f"_{scale:g}pct" if scale != 100 else "")
+        name = plate_name(labels) + (f"_{scale:g}pct" if scale != 100 else "") + ("_full" if full else "")
         self.tg.send(chat, (f"Plate {plate[0]} of {plate[1]}: " if plate else "")
                      + f"Slicing {describe(labels)} ({label}, {infill}% infill"
-                     + (f", scaled to {scale:g}%" if scale != 100 else "") + ", a few minutes)...")
+                     + (f", scaled to {scale:g}%" if scale != 100 else "")
+                     + (", full size edge to edge" if full else "") + ", a few minutes)...")
         # PrusaSlicer applies the preset as overrides; OrcaSlicer uses Anycubic's own process.
         # The infill answer goes on top of either.
         body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides,
@@ -644,6 +646,8 @@ class Bot:
             body["filaments"] = filaments
         if scale != 100:
             body["scale"] = scale
+        if full:
+            body["full_bed"] = True
         if len(items) == 1 and items[0]["count"] == 1 and not filaments:
             body.update({k: v for k, v in items[0].items() if k not in ("count", "filament")})
         else:
@@ -679,6 +683,9 @@ class Bot:
             notes.append("Brim added: tall or small-footprint pieces hold on better with one.")
         if scale != 100:
             notes.append(f"Scaled to {scale:g}% (every part the same, so they still fit together).")
+        if full:
+            notes.append("Full size, edge to edge: no brim or skirt, and it runs right up to the bed's "
+                         "edges, so check the sheet is seated square.")
         left = self.plates.get(chat, {}).get("jobs")
         if plate and left:
             notes.append(f"Plate {plate[0]} of {plate[1]}. When it's off the bed, send next for plate "
@@ -691,9 +698,10 @@ class Bot:
     def offer_resize(self, chat, job, err):
         """The plate doesn't fit: offer to scale it, and/or put each piece on its own plate."""
         fit, separate = err.data.get("fit_scale"), err.data.get("separate")
+        full = err.data.get("full_bed")
         items, labels = job[0], job[1]
         pieces = sum(c for _, c in labels)
-        self.pending[chat] = ("resize", (job, fit, separate), time.time())
+        self.pending[chat] = ("resize", (job, fit, separate, full), time.time())
         msg = str(err).replace("Couldn't lay out the plate: ", "").split(" (HTTP")[0]
         text = f"That won't fit: {msg}."
         if separate and pieces > 1:
@@ -701,9 +709,15 @@ class Bot:
             text += (f"\n\nI can slice them as {pieces} plates, one after the other"
                      + (f", all scaled to {fit}% so the parts still match" if fit else "") + ".")
             rows = [[(choice, "z:split")]]
+            if full:
+                text += " Or full size: each one alone fits if I use the bed edge to edge."
+                rows.append([("Full size, one plate per piece, edge to edge", "z:fullsplit")])
         else:
-            text += f"\n\nI can scale it to {fit}% to fit."
-            rows = [[(f"Scale to {fit}%", "z:scale")]]
+            text += f"\n\nI can scale it to {fit}% to fit." if fit else ""
+            rows = [[(f"Scale to {fit}%", "z:scale")]] if fit else []
+            if full:
+                text += " Or print it full size using the bed edge to edge."
+                rows.append([("Full size, edge to edge", "z:full")])
         self.tg.buttons(chat, text + " Or send no to leave it.", rows)
 
     def choose_resize(self, chat, how):
@@ -712,11 +726,12 @@ class Bot:
             self.tg.send(chat, "That offer ran out; send the link again.")
             return
         del self.pending[chat]
-        job, fit, _separate = arg
+        job, fit, _separate, _full = (*arg, False)[:4]
         items, labels, key, filaments, infill = job[:5]
-        scale = fit or 100
-        if how == "scale":
-            self.background(chat, self.slice_plate, (items, labels, key, filaments, infill, scale))
+        full = how in ("full", "fullsplit")
+        scale = 100 if full else (fit or 100)
+        if how in ("scale", "full"):
+            self.background(chat, self.slice_plate, (items, labels, key, filaments, infill, scale, full))
             return
         # one plate per copy of each piece, each with just its own colour
         jobs = []
@@ -726,7 +741,7 @@ class Bot:
             if filaments:
                 fil = [filaments[max(1, int(item.get("filament") or 1)) - 1]]
             for _ in range(int(item.get("count") or count or 1)):
-                jobs.append(([dict(one, count=1)], [(lab, 1)], key, fil, infill, scale))
+                jobs.append(([dict(one, count=1)], [(lab, 1)], key, fil, infill, scale, full))
         self.plates[chat] = {"jobs": jobs, "total": len(jobs), "next": 1}
         self.next_plate(chat)
 

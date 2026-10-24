@@ -107,7 +107,7 @@ def _set(profiles: dict, key: str, value: str) -> None:
 
 def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str,
                 overrides: dict, out: Path, work: Path, nozzle, filaments: list | None = None,
-                filament_ids: list[int] | None = None, timeout: int = 1800) -> dict:
+                filament_ids: list[int] | None = None, bed_area=None, timeout: int = 1800) -> dict:
     """Slice inputs (one object per file) into out with the profiles for this nozzle.
 
     filaments: colours in order ({color, material, temp?}); filament_ids: the colour (1-based)
@@ -127,6 +127,12 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
         applied[ok] = val
         if k == "brim_width":
             _set(profiles, "brim_type", "outer_only" if float(v) > 0 else "no_brim")
+    if bed_area is not None:
+        # a full-size plate: let Orca accept pieces out to the printer's travel limits
+        x0, y0, x1, y1 = (f"{v:g}" for v in bed_area)
+        profiles["machine"]["printable_area"] = [f"{x0}x{y0}", f"{x1}x{y0}", f"{x1}x{y1}", f"{x0}x{y1}"]
+        profiles["process"]["skirt_loops"] = "0"
+        profiles["process"]["brim_type"] = "no_brim"
     if profiles["process"].get("enable_support") == "1":
         # grid supports: tree tips are too fine for the big nozzles, and it's Anycubic's default
         profiles["process"].setdefault("support_style", "grid")
