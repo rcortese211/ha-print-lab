@@ -1,7 +1,7 @@
 """Read model meshes, lay copies out on the bed, and write the plate as one STL.
 
 Used for multi-piece plates instead of the slicer's own arrange (which crashes in some
-PrusaSlicer builds). Pieces keep their orientation; each is dropped onto the bed and
+PrusaSlicer builds). Pieces keep their orientation (turned about Z only when that's what makes them fit); each is dropped onto the bed and
 placed by a simple shelf packer on its footprint, with a gap between pieces.
 Supports STL (binary/ASCII), 3MF and OBJ. numpy only.
 """
@@ -18,6 +18,7 @@ import numpy as np
 BED = (250.0, 250.0)
 GAP = 6.0
 MARGIN = 10.0          # kept clear around the layout for the skirt line
+SOLO_MARGIN = 4.0      # a plate of one big piece may come this close to the edge
 
 
 class MeshError(Exception):
@@ -141,18 +142,81 @@ def load(path: Path) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- layout
+def _rot_z(t: np.ndarray, deg: float) -> np.ndarray:
+    a = np.radians(deg)
+    c, s = np.cos(a), np.sin(a)
+    return t @ np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]).T
+
+
+def _hull(xy: np.ndarray) -> np.ndarray:
+    """The footprint's convex hull points (same box at every angle, far fewer points)."""
+    xy = np.unique(np.round(xy, 2), axis=0)
+    try:
+        from scipy.spatial import ConvexHull
+        return xy[ConvexHull(xy).vertices]
+    except Exception:          # no scipy, or a degenerate footprint
+        return xy
+
+
+def fit_rotation(t: np.ndarray, room: tuple[float, float], tighten: bool = False) -> tuple[np.ndarray, float]:
+    """Turn a piece about Z so its footprint fits room (w, d), if it doesn't already.
+    Models are often saved at an angle (diagonal panels), which inflates the box we lay out.
+    Picks the fitting angle with the smallest footprint; with tighten, also turns a piece that
+    fits when that shrinks its footprint by a fifth or more (packs plates better).
+    Returns (piece, degrees turned)."""
+    xy = _hull(t.reshape(-1, 3)[:, :2])
+    w, d = np.ptp(xy, axis=0)
+    fits_now = w <= room[0] and d <= room[1]
+    if fits_now and not tighten:
+        return t, 0.0
+    best = None
+    for deg in np.arange(1.0, 180.0, 1.0):
+        a = np.radians(deg)
+        c, s = np.cos(a), np.sin(a)
+        r = xy @ np.array([[c, -s], [s, c]]).T
+        rw, rd = np.ptp(r, axis=0)
+        fits = rw <= room[0] and rd <= room[1]
+        key = (not fits, rw * rd if fits else max(rw - room[0], rd - room[1]))
+        if best is None or key < best[0]:
+            best = (key, deg)
+    if best[0][0]:            # nothing fits; leave it as it was
+        return t, 0.0
+    if fits_now and best[0][1] > 0.8 * w * d:
+        return t, 0.0
+    return _rot_z(t, best[1]), float(best[1])
+
+
+def size(t: np.ndarray) -> tuple[float, float, float]:
+    v = t.reshape(-1, 3)
+    w, d, h = np.ptp(v, axis=0)
+    return float(w), float(d), float(h)
+
+
 def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
-    """Shelf-pack the pieces' footprints onto the bed, centred as a group. Raises if they don't fit."""
+    """Shelf-pack the pieces' footprints onto the bed, centred as a group. Raises if they don't fit.
+    A piece too big for the bed is turned about Z if some angle fits; a plate of one piece may use
+    the bed up to SOLO_MARGIN from the edge."""
+    usable = (BED[0] - 2 * MARGIN, BED[1] - 2 * MARGIN)
+    room = usable if len(pieces) > 1 else (BED[0] - 2 * SOLO_MARGIN, BED[1] - 2 * SOLO_MARGIN)
     sized = []
+    turned = {}
     for i, t in enumerate(pieces):
+        key = id(t)
+        if key not in turned:
+            turned[key] = fit_rotation(t, room, tighten=len(pieces) > 1)[0]
+        t = turned[key]
         lo, hi = t.reshape(-1, 3).min(0), t.reshape(-1, 3).max(0)
         sized.append((i, t - [lo[0], lo[1], lo[2]], hi[0] - lo[0], hi[1] - lo[1]))
-    usable = (BED[0] - 2 * MARGIN, BED[1] - 2 * MARGIN)
+    for i, t, w, d in sized:
+        if w > room[0] or d > room[1]:
+            raise MeshError(f"one piece is {w:.0f} x {d:.0f} mm at its best angle, too big for the "
+                            f"{BED[0]:.0f} x {BED[1]:.0f} mm bed (it would need scaling to about "
+                            f"{100 * min(room[0] / w, room[1] / d):.0f}%)")
+    if len(pieces) == 1:
+        usable = room
     sized.sort(key=lambda s: (-s[3], -s[2]))                  # tallest footprint (Y) first
     placed, x, y, row_h, width = {}, 0.0, 0.0, 0.0, 0.0
     for i, t, w, d in sized:
-        if w > usable[0] or d > usable[1]:
-            raise MeshError(f"one piece is {w:.0f} x {d:.0f} mm, too big for the bed")
         if x > 0 and x + w > usable[0]:
             x, y, row_h = 0.0, y + row_h + GAP, 0.0
         placed[i] = (t, x, y)
@@ -161,8 +225,8 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
         width = max(width, x - GAP)
     depth = y + row_h
     if depth > usable[1]:
-        raise MeshError(f"the pieces need about {width:.0f} x {depth:.0f} mm laid out; the bed is "
-                        f"{BED[0]:.0f} x {BED[1]:.0f}")
+        raise MeshError(f"the pieces need about {width:.0f} x {depth:.0f} mm laid out and don't fit "
+                        f"together on the {BED[0]:.0f} x {BED[1]:.0f} mm bed; print them on separate plates")
     ox, oy = (BED[0] - width) / 2, (BED[1] - depth) / 2
     return [placed[i][0] + [placed[i][1] + ox, placed[i][2] + oy, 0] for i in range(len(pieces))]
 
