@@ -22,7 +22,13 @@ SOLO_MARGIN = 4.0      # a plate of one big piece may come this close to the edg
 
 
 class MeshError(Exception):
-    pass
+    """fit_scale: the biggest scale (%) at which every piece fits the bed on a plate of its own;
+    separate: the pieces fit one at a time but not together."""
+
+    def __init__(self, msg, fit_scale=None, separate=False):
+        super().__init__(msg)
+        self.fit_scale = fit_scale
+        self.separate = separate
 
 
 # --------------------------------------------------------------------------- reading
@@ -197,7 +203,8 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
     A piece too big for the bed is turned about Z if some angle fits; a plate of one piece may use
     the bed up to SOLO_MARGIN from the edge."""
     usable = (BED[0] - 2 * MARGIN, BED[1] - 2 * MARGIN)
-    room = usable if len(pieces) > 1 else (BED[0] - 2 * SOLO_MARGIN, BED[1] - 2 * SOLO_MARGIN)
+    solo = (BED[0] - 2 * SOLO_MARGIN, BED[1] - 2 * SOLO_MARGIN)
+    room = usable if len(pieces) > 1 else solo
     sized = []
     turned = {}
     for i, t in enumerate(pieces):
@@ -207,11 +214,22 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
         t = turned[key]
         lo, hi = t.reshape(-1, 3).min(0), t.reshape(-1, 3).max(0)
         sized.append((i, t - [lo[0], lo[1], lo[2]], hi[0] - lo[0], hi[1] - lo[1]))
-    for i, t, w, d in sized:
-        if w > room[0] or d > room[1]:
-            raise MeshError(f"one piece is {w:.0f} x {d:.0f} mm at its best angle, too big for the "
-                            f"{BED[0]:.0f} x {BED[1]:.0f} mm bed (it would need scaling to about "
-                            f"{100 * min(room[0] / w, room[1] / d):.0f}%)")
+    too_big = [(w, d) for _i, _t, w, d in sized if w > room[0] or d > room[1]]
+    if too_big:
+        # what each piece needs on a plate of its own (turned to its best angle for that)
+        alone = [size(fit_rotation(t, solo)[0])[:2] for t in pieces]
+        scale = min(min(solo[0] / w, solo[1] / d) for w, d in alone)
+        fit = int(scale * 100) if scale < 1 else None
+        many = len(pieces) > 1
+        w, d = max(too_big, key=lambda s: s[0] * s[1])
+        if fit:
+            msg = (f"one piece is {w:.0f} x {d:.0f} mm at its best angle, too big for the "
+                   f"{BED[0]:.0f} x {BED[1]:.0f} mm bed; it would fit scaled to {fit}%"
+                   + (", one piece per plate" if many else ""))
+        else:
+            msg = (f"one piece is {w:.0f} x {d:.0f} mm, too big to share the bed; "
+                   "each piece fits on a plate of its own")
+        raise MeshError(msg, fit_scale=fit, separate=many)
     if len(pieces) == 1:
         usable = room
     sized.sort(key=lambda s: (-s[3], -s[2]))                  # tallest footprint (Y) first
@@ -226,7 +244,8 @@ def arrange(pieces: list[np.ndarray]) -> list[np.ndarray]:
     depth = y + row_h
     if depth > usable[1]:
         raise MeshError(f"the pieces need about {width:.0f} x {depth:.0f} mm laid out and don't fit "
-                        f"together on the {BED[0]:.0f} x {BED[1]:.0f} mm bed; print them on separate plates")
+                        f"together on the {BED[0]:.0f} x {BED[1]:.0f} mm bed; print them on separate plates",
+                        separate=True)
     ox, oy = (BED[0] - width) / 2, (BED[1] - depth) / 2
     return [placed[i][0] + [placed[i][1] + ox, placed[i][2] + oy, 0] for i in range(len(pieces))]
 
@@ -240,6 +259,10 @@ def write_stl(path: Path, parts: list[np.ndarray]) -> None:
     rec["n"], rec["v"] = n, tris
     with open(path, "wb") as f:
         f.write(b"Print Lab plate".ljust(80, b"\0") + struct.pack("<I", len(tris)) + rec.tobytes())
+
+
+def scaled(t: np.ndarray, pct: float) -> np.ndarray:
+    return t if pct == 100 else t * (pct / 100.0)
 
 
 def build_plate(inputs: list[str], out: Path) -> dict:

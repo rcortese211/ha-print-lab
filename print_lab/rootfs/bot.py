@@ -93,7 +93,11 @@ def log(*args):
 
 
 class Err(Exception):
-    pass
+    """data: the error answer's JSON, when there was one (e.g. fit_scale from /slice)."""
+
+    def __init__(self, msg, data=None):
+        super().__init__(msg)
+        self.data = data or {}
 
 
 def http(method, url, body=None, headers=None, timeout=30, raw=False):
@@ -109,13 +113,15 @@ def http(method, url, body=None, headers=None, timeout=30, raw=False):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             out = r.read()
     except urllib.error.HTTPError as err:
-        text = err.read()[:600].decode(errors="ignore")
+        text = err.read()[:4000].decode(errors="ignore")
+        j = None
         try:
             j = json.loads(text)
             text = j.get("message") or j.get("error") or j.get("description") or text
-        except ValueError:
-            pass
-        raise Err(f"{text.strip() or 'error'} (HTTP {err.code})") from err
+        except (ValueError, AttributeError):
+            j = None
+        raise Err(f"{str(text).strip()[:600] or 'error'} (HTTP {err.code})",
+                  j if isinstance(j, dict) else None) from err
     except (urllib.error.URLError, OSError) as err:
         host = urllib.parse.urlsplit(url).hostname
         raise Err(f"can't reach {host} ({getattr(err, 'reason', err)})") from err
@@ -226,6 +232,7 @@ class Bot:
         sources.THINGIVERSE_TOKEN = str(cfg.get("thingiverse_token", ""))
         self.pending = {}          # chat -> (action, arg, since)
         self.job = None            # thread doing a slice/stage
+        self.plates = {}           # chat -> {"jobs": [...], "total": n}: plates still to slice
 
     # ------------------------------------------------------------- dispatch
     def handle(self, msg):
@@ -260,6 +267,8 @@ class Bot:
                 self.confirm(chat)
             elif word in ("no", "n", "/no", "/cancel", "cancel"):
                 self.tg.send(chat, "Cancelled." if self.pending.pop(chat, None) else "Nothing was waiting.")
+            elif word in ("next", "/next"):
+                self.next_plate(chat)
             elif word in QUALITY:
                 self.choose_quality(chat, word)
             elif INFILL_RE.fullmatch(word) and self.pending.get(chat, ("",))[0] == "infill":
@@ -299,6 +308,13 @@ class Bot:
                 self.choose_colour_mode(chat, data[2:])
             else:
                 self.choose_slot(chat, int(data[2:]))
+        elif data in ("z:scale", "z:split"):
+            try:
+                self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "reply_markup": {"inline_keyboard": []}})
+            except Err:
+                pass
+            self.choose_resize(chat, data[2:])
         elif data.startswith("i:") and data[2:].isdigit():
             try:
                 self.tg.api("editMessageReplyMarkup", {"chat_id": chat, "message_id": msg.get("message_id"),
@@ -610,22 +626,35 @@ class Bot:
         del self.pending[chat]
         self.background(chat, self.slice_plate, (*arg, pct))
 
-    def slice_plate(self, chat, job):
-        items, labels, key, filaments, infill = job
+    def slice_plate(self, chat, job, plate=None):
+        """job: (items, labels, quality key, filaments, infill[, scale %]).
+        plate: (n, total) when it's one of several plates."""
+        items, labels, key, filaments, infill = job[:5]
+        scale = job[5] if len(job) > 5 else 100
         label, overrides = QUALITY[key]
-        name = plate_name(labels)
-        self.tg.send(chat, f"Slicing {describe(labels)} ({label}, {infill}% infill, a few minutes)...")
+        name = plate_name(labels) + (f"_{scale:g}pct" if scale != 100 else "")
+        self.tg.send(chat, (f"Plate {plate[0]} of {plate[1]}: " if plate else "")
+                     + f"Slicing {describe(labels)} ({label}, {infill}% infill"
+                     + (f", scaled to {scale:g}%" if scale != 100 else "") + ", a few minutes)...")
         # PrusaSlicer applies the preset as overrides; OrcaSlicer uses Anycubic's own process.
         # The infill answer goes on top of either.
         body = {"name": name, "stage": True, "quality": key, "quality_overrides": overrides,
                 "overrides": {"fill_density": f"{infill}%"}}
         if filaments:
             body["filaments"] = filaments
+        if scale != 100:
+            body["scale"] = scale
         if len(items) == 1 and items[0]["count"] == 1 and not filaments:
-            body.update({k: v for k, v in items[0].items() if k != "count"})
+            body.update({k: v for k, v in items[0].items() if k not in ("count", "filament")})
         else:
             body["models"] = items
-        r = self.lab.post("/slice", body, timeout=1800) or {}
+        try:
+            r = self.lab.post("/slice", body, timeout=1800) or {}
+        except Err as err:
+            if not plate and (err.data.get("fit_scale") or err.data.get("separate")):
+                self.offer_resize(chat, job, err)
+                return
+            raise
         s = r.get("sliced") or {}
         notes = []
         if s.get("nozzle"):
@@ -648,8 +677,75 @@ class Bot:
             notes.append("Supports are on: some overhangs can't print without them.")
         if s.get("brim"):
             notes.append("Brim added: tall or small-footprint pieces hold on better with one.")
+        if scale != 100:
+            notes.append(f"Scaled to {scale:g}% (every part the same, so they still fit together).")
+        left = self.plates.get(chat, {}).get("jobs")
+        if plate and left:
+            notes.append(f"Plate {plate[0]} of {plate[1]}. When it's off the bed, send next for plate "
+                         f"{plate[0] + 1}.")
+        elif plate:
+            notes.append(f"Last plate ({plate[1]} of {plate[1]}).")
         self.ready(chat, (r.get("staged") or {}).get("filename"), s.get("estimated_time"),
                    s.get("filament_g"), s.get("preview"), describe(labels), notes)
+
+    def offer_resize(self, chat, job, err):
+        """The plate doesn't fit: offer to scale it, and/or put each piece on its own plate."""
+        fit, separate = err.data.get("fit_scale"), err.data.get("separate")
+        items, labels = job[0], job[1]
+        pieces = sum(c for _, c in labels)
+        self.pending[chat] = ("resize", (job, fit, separate), time.time())
+        msg = str(err).replace("Couldn't lay out the plate: ", "").split(" (HTTP")[0]
+        text = f"That won't fit: {msg}."
+        if separate and pieces > 1:
+            choice = f"Scale everything to {fit}%, one plate per piece" if fit else "One plate per piece"
+            text += (f"\n\nI can slice them as {pieces} plates, one after the other"
+                     + (f", all scaled to {fit}% so the parts still match" if fit else "") + ".")
+            rows = [[(choice, "z:split")]]
+        else:
+            text += f"\n\nI can scale it to {fit}% to fit."
+            rows = [[(f"Scale to {fit}%", "z:scale")]]
+        self.tg.buttons(chat, text + " Or send no to leave it.", rows)
+
+    def choose_resize(self, chat, how):
+        action, arg, since = self.pending.get(chat, (None, None, 0))
+        if action != "resize" or time.time() - since > CONFIRM_FOR:
+            self.tg.send(chat, "That offer ran out; send the link again.")
+            return
+        del self.pending[chat]
+        job, fit, _separate = arg
+        items, labels, key, filaments, infill = job[:5]
+        scale = fit or 100
+        if how == "scale":
+            self.background(chat, self.slice_plate, (items, labels, key, filaments, infill, scale))
+            return
+        # one plate per copy of each piece, each with just its own colour
+        jobs = []
+        for item, (lab, count) in zip(items, labels):
+            fil = None
+            one = {k: v for k, v in item.items() if k not in ("count", "filament")}
+            if filaments:
+                fil = [filaments[max(1, int(item.get("filament") or 1)) - 1]]
+            for _ in range(int(item.get("count") or count or 1)):
+                jobs.append(([dict(one, count=1)], [(lab, 1)], key, fil, infill, scale))
+        self.plates[chat] = {"jobs": jobs, "total": len(jobs), "next": 1}
+        self.next_plate(chat)
+
+    def next_plate(self, chat):
+        q = self.plates.get(chat)
+        if not q or not q["jobs"]:
+            self.plates.pop(chat, None)
+            self.tg.send(chat, "No more plates waiting.")
+            return
+        job = q["jobs"].pop(0)
+        n = q["next"]
+        q["next"] += 1
+        if not q["jobs"]:
+            self.plates.pop(chat, None)
+
+        def run(chat, job):
+            self.slice_plate(chat, job, plate=(n, q["total"]))
+
+        self.background(chat, run, job)
 
     def ready(self, chat, filename, est, grams, preview=None, what=None, notes=None):
         if not filename:

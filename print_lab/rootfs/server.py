@@ -333,7 +333,11 @@ def check_camera():
 
 
 class JobError(Exception):
-    pass
+    """extra: more fields for the error answer (e.g. fit_scale, separate for a plate too big)."""
+
+    def __init__(self, msg, **extra):
+        super().__init__(msg)
+        self.extra = extra
 
 
 def run(cmd, timeout=900):
@@ -465,11 +469,21 @@ def slice_job(req):
     orientation, supports, needs_brim = {}, False, False
     readable = all(Path(p).suffix.lower() in (".stl", ".3mf", ".obj") for p in inputs)
     want_orient = req.get("orient", True) is not False
-    if readable and (pieces > 1 or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
+    # scale: one percentage for every piece (parts that go together stay the same size)
+    try:
+        scale = float(req.get("scale") or 100)
+    except (TypeError, ValueError):
+        raise JobError("scale must be a percentage") from None
+    if not 10 <= scale <= 400:
+        raise JobError("scale must be between 10 and 400 (%)")
+    if scale != 100 and not readable:
+        raise JobError("Only STL, 3MF and OBJ models can be scaled")
+    if readable and (pieces > 1 or scale != 100
+                     or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
         try:
             meshes = {}
             for p in dict.fromkeys(inputs):
-                tris = mesh.load(Path(p))
+                tris = mesh.scaled(mesh.load(Path(p)), scale)
                 if want_orient and not str(p).startswith(str(WORK)):
                     tris, info = mesh.orient(tris)
                     orientation[Path(p).name] = info
@@ -483,7 +497,8 @@ def slice_job(req):
                 if h > 1.5 * min(w, d) or w * d < 400:
                     needs_brim = True
         except mesh.MeshError as err:
-            raise JobError(f"Couldn't lay out the plate: {err}") from err
+            extra = {k: v for k, v in (("fit_scale", err.fit_scale), ("separate", err.separate)) if v}
+            raise JobError(f"Couldn't lay out the plate: {err}", **extra) from err
         if engine == "orca":
             # one file per piece, kept where we laid it: Orca makes each its own object, so a
             # single failed piece can be cancelled (EXCLUDE_OBJECT) without stopping the plate
@@ -607,7 +622,7 @@ def slice_job(req):
                 grab("filament used [g]")),
             "profile": profile if engine == "prusa" else f"orca {orca_info['quality']} ({nozzle} mm nozzle)",
             "slicer": engine, "orca": orca_info, "nozzle": nozzle, "nozzle_from": nozzle_from,
-            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "orientation": orientation,
+            "layers": data.count(b";LAYER_CHANGE"), "pieces": pieces, "scale": scale, "orientation": orientation,
             "supports": overrides.get("support_material") == "1",
             "brim": float(overrides.get("brim_width") or 0) > 0,
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
@@ -871,7 +886,7 @@ class Handler(BaseHTTPRequestHandler):
                 LOCK.release()
         except (JobError, PrinterError, ValueError, subprocess.TimeoutExpired) as err:
             print(f"[print_lab] slice failed: {type(err).__name__}: {err}", flush=True)
-            self._send(400, {"error": str(err)})
+            self._send(400, {"error": str(err), **getattr(err, "extra", {})})
 
     def _detect(self):
         try:
