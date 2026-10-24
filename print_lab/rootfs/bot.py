@@ -8,7 +8,7 @@ chat ids in its config, and never starts or stops anything without a "yes".
   /files         what Print Lab has (sliced G-code and models)
   /print <name>  stage a Print Lab file on the printer (re-slices a model if needed)
   a link         download a model file, slice it and stage it
-  a model file   send STL/3MF/OBJ/STEP files straight to the chat (several at once = one plate)
+  a model file   send STL/3MF/OBJ/STEP files or a zip straight to the chat (caption: which/how many)
   /stop /pause /resume
   yes / no       confirm or cancel the pending action
 
@@ -593,17 +593,15 @@ class Bot:
         doc = msg["document"]
         name = doc.get("file_name") or "model"
         ext = os.path.splitext(name)[1].lower()
-        if ext not in MODEL_EXT:
-            self.tg.send(chat, f"{name} isn't a model file I can slice (STL, 3MF, OBJ or STEP).")
+        if ext not in MODEL_EXT + (".zip",):
+            self.tg.send(chat, f"{name} isn't a model file I can slice (STL, 3MF, OBJ, STEP, or a zip of them).")
             return
         if (doc.get("file_size") or 0) > 20 * 1024 * 1024:
             self.tg.send(chat, f"{name} is over 20 MB, which is as big as Telegram lets me fetch. "
                          "Send a link to it instead.")
             return
         caption = (msg.get("caption") or "").strip()
-        m = re.search(r"(\d{1,2})\s*[x×*]|[x×*]\s*(\d{1,2})", caption)
-        count = max(1, min(50, int(m.group(1) or m.group(2)))) if m else 1
-        entry = (doc["file_id"], name, count)
+        entry = (doc["file_id"], name, caption)
         group = msg.get("media_group_id")
         if not group:
             self.background(chat, self.fetch_documents, [entry])
@@ -621,21 +619,35 @@ class Bot:
             threading.Timer(3.0, go).start()
 
     def fetch_documents(self, chat, entries):
-        models = LAB / "models"
-        items, labels = [], []
+        """Files (and zips of files) sent to the chat become candidates, picked like a link's files:
+        a caption says which and how many ("all 2x", "all except base"), else I ask when there are several."""
+        cands, words = [], []
         self.tg.send(chat, "Got " + (entries[0][1] if len(entries) == 1 else f"{len(entries)} files") + ".")
-        for file_id, name, count in entries:
-            stem, ext = os.path.splitext(name)
-            fname = safe_name(stem) + ext.lower()
+        for file_id, name, caption in entries:
             data = self.tg.download(file_id)
             if not data:
                 raise Err(f"{name} came through empty")
-            tmp = models / f".{fname}.part"
-            tmp.write_bytes(data)
-            tmp.replace(models / fname)
-            items.append({"model": fname, "count": count})
-            labels.append((stem, count))
-        self.ask_colours(chat, items, labels)
+            if name.lower().endswith(".zip"):
+                inside = sources._zip_candidates(data)
+                if not inside:
+                    raise Err(f"{name} has no model files in it (STL, 3MF, OBJ or STEP)")
+                cands += inside
+            else:
+                cands.append(sources.Candidate(name, len(data), lambda d=data: d))
+            if caption:
+                words.append(caption)
+        title = entries[0][1] if len(entries) == 1 else f"those {len(entries)} files"
+        text = " ".join(words)
+        if len(cands) == 1:
+            m = re.search(r"(\d{1,2})\s*[x×*]|[x×*]\s*(\d{1,2})", text)
+            count = max(1, min(50, int(m.group(1) or m.group(2)))) if m else 1
+            return self.fetch_and_ask(chat, [(cands[0], count)])
+        if not text:
+            return self.list_files_to_pick(chat, title, cands)
+        picked, problems = sources.select(text, cands)
+        if problems or not picked:
+            return self.list_files_to_pick(chat, title, cands, problems)
+        return self.fetch_and_ask(chat, picked)
 
     def ask_colours(self, chat, items, labels):
         """Several different parts: offer one colour per part from what's loaded in the ACE."""
