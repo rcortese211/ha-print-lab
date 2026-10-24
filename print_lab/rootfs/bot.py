@@ -9,6 +9,7 @@ chat ids in its config, and never starts or stops anything without a "yes".
   /print <name>  stage a Print Lab file on the printer (re-slices a model if needed)
   a link         download a model file, slice it and stage it
   a model file   send STL/3MF/OBJ/STEP files or a zip straight to the chat (caption: which/how many)
+  archive only   add to a link, file caption or file pick: keep the files on the drive, don't slice
   /stop /pause /resume
   yes / no       confirm or cancel the pending action
 
@@ -64,6 +65,16 @@ def colour_name(hexcol):
 def slot_label(s):
     what = " ".join(x for x in (colour_name(s["color"]) if s.get("color") else "", s.get("name") or s.get("material") or "") if x)
     return f"Slot {s['slot']} · {what or 'filament'}"
+ARCHIVE_RE = re.compile(r"\b(?:archive(?:\s+only)?|save\s+only|just\s+save(?:\s+it|\s+them)?)\b", re.I)
+
+
+def archive_flag(text):
+    """'archive only' (or 'just save', 'save only') anywhere in a message: keep the files, don't slice.
+    Returns (archive?, the text without it)."""
+    text = text or ""
+    return bool(ARCHIVE_RE.search(text)), " ".join(ARCHIVE_RE.sub(" ", text).split()).strip(" ,;")
+
+
 INFILL_RE = re.compile(r"\d{2,3}%?")
 
 QUALITY = {
@@ -80,6 +91,7 @@ HELP = (
     "/files - files Print Lab has\n"
     "/frames [n] - camera frames the failure check kept (every 5 min while printing + suspicious ones)\n"
     "/print <name> - put a Print Lab file on the printer\n"
+    "archive only - add it to a link, a file's caption or your file pick to just keep the files for later\n"
     "bed 65 - hotter (or cooler) bed for the next thing you send; bed normal to undo\n"
     "first 225 - nozzle temperature for the first layer, same way; first normal to undo\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
@@ -522,18 +534,12 @@ class Bot:
 
     def stage_links(self, chat, job):
         links, words = job
+        archive, words = archive_flag(words)
         self.tg.send(chat, "Looking at that link..." if len(links) == 1 else f"Looking at {len(links)} links...")
         if len(links) == 1:
             url, count = links[0]
             title, cands = sources.resolve(url)
-            if not words and len(cands) == 1:
-                return self.fetch_and_ask(chat, [(cands[0], count)])
-            if not words:
-                return self.list_files_to_pick(chat, title, cands)
-            picked, problems = sources.select(words, cands)
-            if problems or not picked:
-                return self.list_files_to_pick(chat, title, cands, problems)
-            return self.fetch_and_ask(chat, picked)
+            return self.choose_candidates(chat, title, cands, words, archive, count)
         picked, problems = [], []
         for n, (url, count) in enumerate(links, 1):
             try:
@@ -548,28 +554,47 @@ class Bot:
         if problems:
             self.tg.send(chat, "Couldn't do that batch:\n" + "\n".join(problems))
             return
-        self.fetch_and_ask(chat, picked)
+        self.fetch_and_ask(chat, picked, archive)
 
-    def list_files_to_pick(self, chat, title, cands, problems=None):
-        self.pending[chat] = ("pick", (title, cands), time.time())
+    def choose_candidates(self, chat, title, cands, words, archive=False, count=1):
+        """Files from a link, zip or upload: the words say which and how many; with none, ask
+        (or, when archiving, keep them all)."""
+        if not words and (len(cands) == 1 or archive):
+            return self.fetch_and_ask(chat, [(c, count) for c in cands], archive)
+        if not words:
+            return self.list_files_to_pick(chat, title, cands, archive=archive)
+        picked, problems = sources.select(words, cands)
+        if problems or not picked:
+            return self.list_files_to_pick(chat, title, cands, problems, archive)
+        return self.fetch_and_ask(chat, picked, archive)
+
+    def list_files_to_pick(self, chat, title, cands, problems=None, archive=False):
+        self.pending[chat] = ("pick", (title, cands, archive), time.time())
         lines = [f"Hmm: {'; '.join(problems)}.", ""] if problems else []
         lines.append(f"{title} has {len(cands)} files:")
         for i, c in enumerate(cands, 1):
             lines.append(f"  {i}. {c.name}" + (f"  ({max(1, round(c.size / 1024))} KB)" if c.size else ""))
-        lines.append('Which ones, and how many? e.g. "2 small, 2 large", "1 x2, 2 x2", '
-                     '"all 19x", "2 of each except base"')
+        lines.append(('Which ones should I keep? e.g. "all", "all except base"' if archive else
+                      'Which ones, and how many? e.g. "2 small, 2 large", "1 x2, 2 x2", '
+                      '"all 19x", "2 of each except base"')
+                     + ("" if archive else '. Add "archive only" to just keep them for later.'))
         self.tg.send(chat, "\n".join(lines))
 
     def pick_files(self, chat, text):
-        _action, (title, cands), _since = self.pending[chat]
+        _action, (title, cands, *rest), _since = self.pending[chat]
+        archive, text = archive_flag(text)
+        archive = archive or bool(rest and rest[0])
+        if archive and not text:
+            text = "all"
         picked, problems = sources.select(text, cands)
         if problems or not picked:
-            return self.list_files_to_pick(chat, title, cands, problems or ["I didn't catch which files"])
+            return self.list_files_to_pick(chat, title, cands, problems or ["I didn't catch which files"], archive)
         del self.pending[chat]
-        self.fetch_and_ask(chat, picked)
+        self.fetch_and_ask(chat, picked, archive)
 
-    def fetch_and_ask(self, chat, picked):
-        """Download the chosen files into Print Lab's models folder, then ask for the quality."""
+    def fetch_and_ask(self, chat, picked, archive=False):
+        """Download the chosen files into Print Lab's models folder, then ask for the quality
+        (archive: just keep them there for later)."""
         models = LAB / "models"
         items, labels = [], []
         for cand, count in picked:
@@ -585,6 +610,13 @@ class Bot:
                 tmp.replace(dest)
             items.append({"model": fname, "count": count})
             labels.append((cand.stem, count))
+        if archive:
+            names = list(dict.fromkeys(i["model"] for i in items))
+            self.tg.send(chat, f"Saved {len(names)} file" + ("s" if len(names) != 1 else "")
+                         + " to the models drive, not sliced:\n  " + "\n  ".join(names)
+                         + "\n\nTo print later: /print " + names[0].rsplit(".", 1)[0]
+                         + (" (or several: /print a, b x2)" if len(names) > 1 else ""))
+            return
         self.ask_colours(chat, items, labels)
 
     # ------------------------------------------------------------- colours
@@ -637,17 +669,12 @@ class Bot:
             if caption:
                 words.append(caption)
         title = entries[0][1] if len(entries) == 1 else f"those {len(entries)} files"
-        text = " ".join(words)
+        archive, text = archive_flag(" ".join(words))
         if len(cands) == 1:
             m = re.search(r"(\d{1,2})\s*[x×*]|[x×*]\s*(\d{1,2})", text)
             count = max(1, min(50, int(m.group(1) or m.group(2)))) if m else 1
-            return self.fetch_and_ask(chat, [(cands[0], count)])
-        if not text:
-            return self.list_files_to_pick(chat, title, cands)
-        picked, problems = sources.select(text, cands)
-        if problems or not picked:
-            return self.list_files_to_pick(chat, title, cands, problems)
-        return self.fetch_and_ask(chat, picked)
+            return self.fetch_and_ask(chat, [(cands[0], count)], archive)
+        return self.choose_candidates(chat, title, cands, text, archive)
 
     def ask_colours(self, chat, items, labels):
         """Several different parts: offer one colour per part from what's loaded in the ACE."""
