@@ -177,6 +177,7 @@ def slice_files(name: str, inputs: list[str], keep_positions: bool, quality: str
         pass
     gcode = outdir / "plate_1.gcode"
     if p.returncode != 0 or not gcode.is_file():
+        print(f"[orca] failed: {' '.join(cmd)}\n{(p.stdout + p.stderr)[-3000:]}", flush=True)
         msg = result.get("error_string") or " | ".join((p.stdout + p.stderr).strip().splitlines()[-6:])
         raise OrcaError(f"OrcaSlicer couldn't slice it: {msg or 'no message'}")
     shutil.move(str(gcode), out)

@@ -870,6 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 LOCK.release()
         except (JobError, PrinterError, ValueError, subprocess.TimeoutExpired) as err:
+            print(f"[print_lab] slice failed: {type(err).__name__}: {err}", flush=True)
             self._send(400, {"error": str(err)})
 
     def _detect(self):
