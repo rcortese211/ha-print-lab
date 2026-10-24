@@ -97,9 +97,17 @@ systemctl enable printlab.service printlab-update.timer printlab-bot.service
 systemctl start printlab-update.timer
 systemctl restart printlab.service printlab-bot.service
 # Claude's Remote Control server: Robbie enables it once after logging in (pi/README.md);
-# after that, updates keep Claude Code current and restart it
+# after that, updates keep Claude Code current
+# Restarted only when Claude Code itself was upgraded, so an update doesn't cut off a session
+# that's in use (e.g. one watching a print).
 if systemctl is-enabled --quiet printlab-claude.service 2>/dev/null; then
+    before=$(dpkg-query -W -f='${Version}' claude-code 2>/dev/null || true)
     apt-get install -y -qq --only-upgrade claude-code || true
-    systemctl restart printlab-claude.service || true
+    after=$(dpkg-query -W -f='${Version}' claude-code 2>/dev/null || true)
+    if [ "$before" != "$after" ]; then
+        systemctl restart printlab-claude.service || true
+    else
+        systemctl start printlab-claude.service || true
+    fi
 fi
 echo "Print Lab installed; admin token is in /etc/printlab/printlab.env"
