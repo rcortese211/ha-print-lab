@@ -8,6 +8,7 @@ chat ids in its config, and never starts or stops anything without a "yes".
   /files         what Print Lab has (sliced G-code and models)
   /print <name>  stage a Print Lab file on the printer (re-slices a model if needed)
   a link         download a model file, slice it and stage it
+  a model file   send STL/3MF/OBJ/STEP files straight to the chat (several at once = one plate)
   /stop /pause /resume
   yes / no       confirm or cancel the pending action
 
@@ -134,6 +135,17 @@ def http(method, url, body=None, headers=None, timeout=30, raw=False):
 class Telegram:
     def __init__(self, token):
         self.base = f"https://api.telegram.org/bot{token}/"
+        self.files = f"https://api.telegram.org/file/bot{token}/"
+
+    def download(self, file_id, limit=20 * 1024 * 1024):
+        """A file someone sent the bot (Telegram lets bots fetch up to 20 MB)."""
+        info = self.api("getFile", {"file_id": file_id})
+        if not info.get("file_path"):
+            raise Err("Telegram didn't hand over that file")
+        data = http("GET", self.files + info["file_path"], timeout=120, raw=True)
+        if len(data) > limit:
+            raise Err("that file is over 20 MB")
+        return data
 
     def api(self, method, params=None, timeout=30):
         r = http("POST", self.base + method, params or {}, timeout=timeout)
@@ -235,6 +247,8 @@ class Bot:
         sources.THINGIVERSE_TOKEN = str(cfg.get("thingiverse_token", ""))
         self.pending = {}          # chat -> (action, arg, since)
         self.job = None            # thread doing a slice/stage
+        self.lock = threading.Lock()
+        self.albums = {}           # media_group_id -> files sent together, gathered for a moment
         self.plates = {}           # chat -> {"jobs": [...], "total": n}: plates still to slice
         self.bed = {}              # chat -> bed temperature for the next job (all its plates)
         self.first = {}            # chat -> nozzle temperature for the first layer, same scope
@@ -263,8 +277,16 @@ class Bot:
         if chat not in self.chats or (sender is not None and sender not in self.chats and chat != sender):
             log(f"ignored a message from {sender} in {chat}")
             return
-        text = (msg.get("text") or "").strip()
+        doc = msg.get("document")
+        if doc:
+            self.take_document(chat, msg)
+            return
+        text = (msg.get("text") or msg.get("caption") or "").strip()
         if not text:
+            what = next((k for k in ("photo", "video", "voice", "sticker", "audio", "animation") if k in msg),
+                        "that")
+            self.tg.send(chat, f"I can't do anything with a {what}. Send a model file (STL, 3MF, OBJ, STEP), "
+                         "a link to one, or /help.")
             return
         word = text.split()[0].lower().split("@")[0]
         rest = text[len(text.split()[0]):].strip()
@@ -566,6 +588,55 @@ class Bot:
         self.ask_colours(chat, items, labels)
 
     # ------------------------------------------------------------- colours
+    def take_document(self, chat, msg):
+        """A model file sent straight to the bot. Several sent together (an album) make one plate."""
+        doc = msg["document"]
+        name = doc.get("file_name") or "model"
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in MODEL_EXT:
+            self.tg.send(chat, f"{name} isn't a model file I can slice (STL, 3MF, OBJ or STEP).")
+            return
+        if (doc.get("file_size") or 0) > 20 * 1024 * 1024:
+            self.tg.send(chat, f"{name} is over 20 MB, which is as big as Telegram lets me fetch. "
+                         "Send a link to it instead.")
+            return
+        caption = (msg.get("caption") or "").strip()
+        m = re.search(r"(\d{1,2})\s*[x×*]|[x×*]\s*(\d{1,2})", caption)
+        count = max(1, min(50, int(m.group(1) or m.group(2)))) if m else 1
+        entry = (doc["file_id"], name, count)
+        group = msg.get("media_group_id")
+        if not group:
+            self.background(chat, self.fetch_documents, [entry])
+            return
+        # an album arrives as one message per file: collect them for a moment, then do them together
+        with self.lock:
+            batch = self.albums.setdefault(group, [])
+            batch.append(entry)
+            first = len(batch) == 1
+        if first:
+            def go():
+                with self.lock:
+                    entries = self.albums.pop(group, [])
+                self.background(chat, self.fetch_documents, entries)
+            threading.Timer(3.0, go).start()
+
+    def fetch_documents(self, chat, entries):
+        models = LAB / "models"
+        items, labels = [], []
+        self.tg.send(chat, "Got " + (entries[0][1] if len(entries) == 1 else f"{len(entries)} files") + ".")
+        for file_id, name, count in entries:
+            stem, ext = os.path.splitext(name)
+            fname = safe_name(stem) + ext.lower()
+            data = self.tg.download(file_id)
+            if not data:
+                raise Err(f"{name} came through empty")
+            tmp = models / f".{fname}.part"
+            tmp.write_bytes(data)
+            tmp.replace(models / fname)
+            items.append({"model": fname, "count": count})
+            labels.append((stem, count))
+        self.ask_colours(chat, items, labels)
+
     def ask_colours(self, chat, items, labels):
         """Several different parts: offer one colour per part from what's loaded in the ACE."""
         if len(items) < 2:
