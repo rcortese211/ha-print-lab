@@ -31,6 +31,8 @@ Home Assistant `kobra_print` integration.
 
 ### Temperature towers
 
+`POST /slice` applies a few slicing rules from the plate's shape (concentric surfaces for round parts, a slower and hotter first layer for big ones). They never override a setting the request sets, `"rules": false` turns them off, and the response lists the ones that fired in `rules`. See [print_lab/rootfs/RULES.md](print_lab/rootfs/RULES.md).
+
 `POST /slice` also takes `temps`: a list of `[height_mm, nozzle_c]` steps. After slicing, an `M104` is inserted at the first layer at or above each height, so each tier of a temperature tower prints at its own temperature. The response lists the steps it applied in `temps_applied`.
 
 ### Calibration steps (`tune`)

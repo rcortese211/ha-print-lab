@@ -39,6 +39,7 @@ import mesh
 import orca
 import plate
 import plateguard
+import rules
 import watch
 from printer import Printer, PrinterError
 from watch import Detector, WatchError
@@ -495,6 +496,7 @@ def slice_job(req):
     out = GCODE / f"{name}.gcode"
     pieces = len(inputs)
     orientation, supports, needs_brim = {}, False, False
+    laid = None
     readable = all(Path(p).suffix.lower() in (".stl", ".3mf", ".obj") for p in inputs)
     want_orient = req.get("orient", True) is not False
     # scale: one percentage for every piece (parts that go together stay the same size)
@@ -568,6 +570,16 @@ def slice_job(req):
                           "support_material_style": "grid"})
     if needs_brim and not full_bed and "brim_width" not in overrides:
         overrides["brim_width"] = "5"
+    # rules of thumb from the plate's shape (round parts, big first layers): see rules.py
+    rule_notes = []
+    if engine == "orca" and readable and req.get("rules", True) is not False:
+        try:
+            parts = laid if laid is not None else [mesh.load(Path(p)) for p in inputs]
+            taken = set(overrides) | {orca.KEYS.get(k, (k,))[0] for k in overrides}
+            extra, rule_notes = rules.plan(parts, taken)
+            overrides.update(extra)
+        except mesh.MeshError:
+            pass
     for k, v in overrides.items():
         if not KEY_RE.fullmatch(k) or not VAL_RE.fullmatch(v):
             raise JobError(f"Bad override {k}={v}")
@@ -665,7 +677,7 @@ def slice_job(req):
             "supports": overrides.get("support_material") == "1",
             "brim": float(overrides.get("brim_width") or 0) > 0,
             "preview": f"/preview/{out.stem}.png", "temps_applied": applied,
-            "retracts_applied": retracts_applied}
+            "retracts_applied": retracts_applied, "rules": rule_notes}
 
 
 def profile_value(profile, key):
