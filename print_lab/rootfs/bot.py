@@ -97,6 +97,7 @@ HELP = (
     "bed 65 - hotter (or cooler) bed for the next thing you send; bed normal to undo\n"
     "first 225 - nozzle temperature for the first layer, same way; first normal to undo\n"
     "as modeled - print the next thing the way it was modeled, no auto-orient; auto orient to undo\n"
+    "reslice - slice the last plate again, same parts, slots and settings (after a fix, or with new bed/first/as modeled)\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
     "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large,\n"
@@ -269,6 +270,7 @@ class Bot:
         self.bed = {}              # chat -> bed temperature for the next job (all its plates)
         self.first = {}            # chat -> nozzle temperature for the first layer, same scope
         self.as_modeled = {}       # chat -> True: next job keeps the model's own orientation
+        self.last = {}             # chat -> the last plate sliced, with its settings (for reslice)
         self.load_state()
 
     def load_state(self):
@@ -276,14 +278,14 @@ class Bot:
             st = json.loads(STATE.read_text())
         except (OSError, ValueError):
             return
-        for key in ("plates", "bed", "first", "as_modeled"):
+        for key in ("plates", "bed", "first", "as_modeled", "last"):
             getattr(self, key).update({int(c): v for c, v in (st.get(key) or {}).items()})
 
     def save_state(self):
         try:
             tmp = STATE.with_suffix(".tmp")
             tmp.write_text(json.dumps({"plates": self.plates, "bed": self.bed, "first": self.first,
-                                      "as_modeled": self.as_modeled}))
+                                      "as_modeled": self.as_modeled, "last": self.last}))
             tmp.replace(STATE)
         except OSError as err:
             log("couldn't save bot state:", err)
@@ -339,6 +341,8 @@ class Bot:
                 self.set_as_modeled(chat, not re.search(r"(off|normal|undo)$", text.strip().lower()))
             elif text.strip().lower() in ("auto orient", "/autoorient", "auto-orient"):
                 self.set_as_modeled(chat, False)
+            elif word in ("reslice", "/reslice"):
+                self.reslice(chat)
             elif word in ("next", "/next"):
                 self.next_plate(chat)
             elif word in QUALITY:
@@ -894,6 +898,10 @@ class Bot:
         as_modeled = self.as_modeled.get(chat)
         if as_modeled:
             body["orient"] = False
+        # remembered for reslice: the same plate with the same choices
+        self.last[chat] = {"job": list(job), "plate": list(plate) if plate else None,
+                           "bed": bed, "first": first, "as_modeled": bool(as_modeled)}
+        self.save_state()
         if full:
             body["full_bed"] = True
         if len(items) == 1 and items[0]["count"] == 1 and not filaments:
@@ -957,7 +965,7 @@ class Bot:
     def set_bed(self, chat, arg):
         arg = arg.strip().lower().rstrip("c°").strip()
         if arg in ("", "normal", "default", "off", "reset"):
-            self.bed.pop(chat, None)
+            self.bed[chat] = 0             # 0 = the profile's own (and overrides a reslice's)
             self.save_state()
             self.tg.send(chat, "Bed back to the profile's temperature (55 °C for PLA).")
             return
@@ -977,7 +985,7 @@ class Bot:
     def set_first(self, chat, arg):
         arg = arg.strip().lower().rstrip("c°").strip()
         if arg in ("", "normal", "default", "off", "reset"):
-            self.first.pop(chat, None)
+            self.first[chat] = 0
             self.save_state()
             self.tg.send(chat, "First layer back to the profile's temperature (215 °C for PLA).")
             return
@@ -994,13 +1002,31 @@ class Bot:
         self.tg.send(chat, f"First layer at {temp} °C on the nozzle for the next thing you send "
                      "(every plate of it). first normal to undo.")
 
+    def reslice(self, chat):
+        """Slice the last plate again with the same parts, slots, quality, infill and settings,
+        e.g. after a fix. bed/first/as modeled sent just before reslice override the remembered ones."""
+        last = self.last.get(chat)
+        if not last:
+            self.tg.send(chat, "Nothing to reslice yet; send the file or link.")
+            return
+        for key, store in (("bed", self.bed), ("first", self.first), ("as_modeled", self.as_modeled)):
+            if chat not in store and last.get(key):
+                store[chat] = last[key]
+        self.save_state()
+        plate = tuple(last["plate"]) if last.get("plate") else None
+
+        def run(chat, job):
+            self.slice_plate(chat, job, plate=plate)
+
+        self.background(chat, run, tuple(last["job"]))
+
     def set_as_modeled(self, chat, on):
         if on:
             self.as_modeled[chat] = True
             msg = ("As modeled for the next thing you send (every plate of it): no auto-orient, each part "
                    "prints the way it was modeled. auto orient to undo.")
         else:
-            self.as_modeled.pop(chat, None)
+            self.as_modeled[chat] = False
             msg = "Back to auto-orient: I'll rest each part on its best face."
         self.save_state()
         self.tg.send(chat, msg)
