@@ -31,6 +31,12 @@ chat, which is fine, but keep anything written to files or external places clean
 - Rinkhals (custom firmware, Moonraker on :7125, Fluidd on :4409) is installed on the printer. The camera
   is Rinkhals' mjpg-streamer now; the stock FLV feed on :18088 is gone.
 
+## Failed prints
+- Start from `print_lab/rootfs/diagnose.json`: symptoms with causes ranked for this printer and its
+  profiles (the bot's `/diagnose` shows the same guide). Check the likely causes against evidence first:
+  kept camera frames in `watch/history`, `journalctl -u printlab`, Moonraker `print_stats`, and the
+  profile values used for the slice. Update the guide when a real failure teaches something new.
+
 ## Rules
 - Anything physical waits for Robbie's explicit go ("send it"): starting prints, moving the head
   or bed, heating, stopping a print he didn't ask to stop.

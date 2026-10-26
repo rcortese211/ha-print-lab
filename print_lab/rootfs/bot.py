@@ -11,6 +11,7 @@ chat ids in its config, and never starts or stops anything without a "yes".
   a model file   send STL/3MF/OBJ/STEP files or a zip straight to the chat (caption: which/how many)
   archive only   add to a link, file caption or file pick: keep the files on the drive, don't slice
   /stop /pause /resume
+  /diagnose      what went wrong with a print: pick a symptom, get likely causes and fixes
   yes / no       confirm or cancel the pending action
 
 Everything goes through Print Lab on this machine, which talks to the printer directly,
@@ -42,6 +43,7 @@ MODEL_EXT = (".stl", ".3mf", ".obj", ".step", ".stp")
 TOKEN = os.environ.get("PRINTLAB_ADMIN_TOKEN", "")
 CONFIRM_FOR = 15 * 60
 STATE = LAB / "bot_state.json"     # queued plates and per-job temperatures, kept across restarts
+DIAGNOSE = Path(__file__).with_name("diagnose.json")   # failed-print guide, shared with the Pi's Claude
 LINK_RE = re.compile(r"https?://\S+")
 # Quality presets for links, as overrides on the tuned profile (pla_08, 0.8 mm nozzle). Its
 # flow cap (15 mm3/s) sets the real speed, so these change layers, walls, infill and ironing.
@@ -100,6 +102,7 @@ HELP = (
     "  or filter by name: all 19x, all except base, 2 of each 19x\n"
     "/print hook x3, clip x5 - same with models Print Lab already has\n"
     "/pause  /resume  /stop\n"
+    "/diagnose [symptom] - likely causes and fixes for a failed print (stringing, warping, ...)\n"
     "Nothing starts or stops until you reply yes."
 )
 
@@ -314,6 +317,8 @@ class Bot:
             elif word == "/print":
                 self.background(chat, self.stage_name, rest) if rest else \
                     self.tg.send(chat, "Which one? /print <name> - see /files")
+            elif word == "/diagnose":
+                self.diagnose(chat, rest)
             elif word in ("/stop", "/pause", "/resume"):
                 self.ask(chat, word[1:], None,
                          {"stop": "Stop the current print? It can't be resumed. Reply yes to stop.",
@@ -389,6 +394,8 @@ class Bot:
             except Err:
                 pass
             self.choose_infill(chat, int(data[2:]))
+        elif data.startswith("d:"):
+            self.diagnose(chat, data[2:])
 
     def background(self, chat, fn, arg):
         if self.job and self.job.is_alive():
@@ -469,6 +476,31 @@ class Bot:
             self.tg.photo(chat, jpg, "\n".join(lines))
         else:
             self.tg.send(chat, "\n".join(lines))
+
+    def diagnose(self, chat, rest):
+        """Causes and fixes for one symptom from diagnose.json, or buttons to pick one."""
+        try:
+            guide = json.loads(DIAGNOSE.read_text())["symptoms"]
+        except (OSError, ValueError, KeyError) as err:
+            self.tg.send(chat, f"The diagnosis guide isn't readable: {err}")
+            return
+        words = [w for w in re.findall(r"[a-z]+", rest.lower())
+                 if len(w) > 3 and w not in ("print", "prints", "printed", "printing", "with", "have", "keeps")]
+        score = {k: sum(w in f"{k} {v['label']}".lower() for w in words) for k, v in guide.items()}
+        best = max(score.values(), default=0)
+        hits = [k for k in guide if rest.strip().lower() == k] or \
+            ([k for k, n in score.items() if n == best] if best else [])
+        if len(hits) != 1:
+            keys = list(guide)
+            self.tg.buttons(chat, "What does the failed print look like?",
+                            [[(guide[k]["label"], f"d:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)])
+            return
+        s = guide[hits[0]]
+        lines = [s["label"], "Most likely first:"]
+        for i, c in enumerate(s["causes"], 1):
+            lines.append(f"\n{i}. {c['cause']}\n   Check: {c['check']}\n   Fix: {c['fix']}")
+        lines.append("\n/frames shows what the camera kept; send a photo to Claude for a closer look.")
+        self.tg.send(chat, "\n".join(lines))
 
     def frames(self, chat, rest):
         """Send the camera frames the failure check kept (newest first)."""

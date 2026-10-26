@@ -1,0 +1,124 @@
+{
+  "about": "Failed-print guide for the Kobra S1 (enclosed CoreXY, direct drive, Rinkhals/Klipper, ACE Pro) with Print Lab's OrcaSlicer profiles. Symptom list modelled on the Print Diagnosis tool at rapidelevation.com/diagnosis.html; causes are ordered most likely first for this printer. Profile numbers: PLA 205 C (215 C first layer) on 0.4, 220 C on 0.8, bed 55 C / 60 C, retraction 0.8 mm at 40 mm/s, flow cap 12 mm3/s, pressure advance 0.035 / 0.03, fan 100% from layer 2.",
+  "symptoms": {
+    "adhesion": {
+      "label": "Won't stick / first layer lifts",
+      "causes": [
+        {"cause": "Dirty plate", "check": "Fingerprints or a shiny patch where earlier prints sat.", "fix": "Wash the plate with dish soap and warm water, then dry it; wipe with 90%+ IPA between prints. Don't touch the print area."},
+        {"cause": "Z offset too high", "check": "First-layer lines are round with gaps between them instead of slightly flattened.", "fix": "Lower Z offset 0.02 mm at a time on the touchscreen (or in Fluidd) during the first layer until the lines just touch."},
+        {"cause": "Bed too cool for the part", "check": "Large flat parts lift at the corners; small ones are fine.", "fix": "Send 'bed 65' to the bot before the next job (PLA), or 80 for PETG. 'bed normal' undoes it."},
+        {"cause": "First layer too cold", "check": "Lines are thin or dragged at corners.", "fix": "Send 'first 225' to the bot for a hotter first layer; the high-quality preset also slows things down."},
+        {"cause": "Small contact area", "check": "Tall thin parts, or parts standing on a point or edge.", "fix": "Re-orient onto a larger flat face, or add a brim (ask Claude to re-slice with one)."}
+      ]
+    },
+    "warping": {
+      "label": "Corners curl / warping",
+      "causes": [
+        {"cause": "Material shrinks (PETG, ABS, ASA)", "check": "Only with non-PLA, worse on long parts.", "fix": "Keep the enclosure shut, let the chamber warm up for 10 minutes before printing, and lower part cooling for ABS/ASA."},
+        {"cause": "Bed too cool or adhesion weak", "check": "Corners lift in the first few millimetres.", "fix": "Raise the bed 5-10 C ('bed 65') and clean the plate; add a brim or mouse ears."},
+        {"cause": "Draft through an open door or lid", "check": "One side lifts more than the others.", "fix": "Close the enclosure; keep the printer away from fans and open windows."},
+        {"cause": "Sharp corners on large flat parts", "check": "Lifting starts at 90-degree corners.", "fix": "Brim, or fillet the corners in the model."}
+      ]
+    },
+    "spaghetti": {
+      "label": "Spaghetti / print came loose",
+      "causes": [
+        {"cause": "Part knocked off the plate", "check": "The kept camera frames (/frames) show when it moved.", "fix": "Fix adhesion first (see 'Won't stick'); add a brim for tall or small-footprint parts."},
+        {"cause": "Curled overhang hit by the nozzle", "check": "Failure starts at an overhang or bridge; edges curl up before it goes.", "fix": "Add supports or re-orient; keep the fan at 100% for PLA (z-hop is already 0.4 mm)."},
+        {"cause": "Tall thin part wobbling", "check": "Part snapped or bent near the base.", "fix": "Brim, print several together, or slow down with the high-quality preset."},
+        {"cause": "Lost extrusion mid-print", "check": "Strands thin out before the mess starts.", "fix": "See 'Gaps / under-extrusion' and 'Clicking extruder'."}
+      ]
+    },
+    "under_extrusion": {
+      "label": "Gaps / under-extrusion / weak walls",
+      "causes": [
+        {"cause": "Hitting the hotend's flow limit", "check": "Worse on fast infill and with the 0.8 nozzle; walls fine, infill sparse.", "fix": "The profiles cap flow at 12 mm3/s; on the 0.8 use medium or high, or run PLA 5-10 C hotter."},
+        {"cause": "Partial clog", "check": "Thin or uneven lines everywhere, not just at speed.", "fix": "Cold pull: heat to 210 C, push filament by hand, cool to about 90 C, pull hard. Repeat until the tip comes out clean."},
+        {"cause": "ACE feed drag", "check": "Gaps come and go; a spool sticks or the tube is kinked.", "fix": "Check the spool turns freely and the PTFE path is smooth; re-seat the hub connectors."},
+        {"cause": "Wet filament", "check": "Crackling or popping while printing, rough surface, steam at the nozzle.", "fix": "Dry it (PLA 50 C, PETG 65 C, 6 h) and store it with desiccant."},
+        {"cause": "Wrong nozzle setting", "check": "The slice was for a different nozzle than the one fitted.", "fix": "Set the right nozzle on the touchscreen; Print Lab reads it before every slice."}
+      ]
+    },
+    "clicking": {
+      "label": "Clicking / grinding extruder",
+      "causes": [
+        {"cause": "Clog or jam", "check": "Filament won't push through by hand at temperature.", "fix": "Cold pull; if that fails, swap the nozzle."},
+        {"cause": "Too fast for the temperature", "check": "Clicks only on infill or fast moves.", "fix": "5-10 C hotter, or a slower preset."},
+        {"cause": "Heat creep", "check": "Long PLA prints in a hot closed enclosure; jams after hours.", "fix": "For PLA, crack the lid open; keep the hotend fan and heatsink free of dust."},
+        {"cause": "Chewed filament", "check": "Grooves or dust on the filament at the extruder.", "fix": "Cut back past the damage, reload, and brush the drive gear clean."}
+      ]
+    },
+    "stringing": {
+      "label": "Stringing / hairs",
+      "causes": [
+        {"cause": "Wet filament", "check": "Strings plus popping and fuzz; worse with PETG and TPU.", "fix": "Dry it. This fixes most stringing on this printer."},
+        {"cause": "Nozzle too hot", "check": "Strings thin out as a temperature tower gets cooler.", "fix": "Drop 5-10 C, or ask Claude for a temperature tower."},
+        {"cause": "Retraction too short", "check": "Profile retraction is 0.8 mm; strings are thick and regular.", "fix": "Try 1.0-1.2 mm; direct drive rarely needs more than 2 mm."},
+        {"cause": "PETG strings anyway", "check": "Material is PETG.", "fix": "Run cooler (230-235 C) and dry it; a quick pass with a heat gun cleans off light wisps."}
+      ]
+    },
+    "blobs": {
+      "label": "Zits, blobs, pitting",
+      "causes": [
+        {"cause": "Wet filament", "check": "Small craters spread across the surface.", "fix": "Dry it."},
+        {"cause": "Seam", "check": "Bumps line up in one vertical line.", "fix": "The profile uses an aligned seam; ask for a rear or random seam when re-slicing."},
+        {"cause": "Pressure advance off for this filament", "check": "Blobs at line starts, thin ends at corners.", "fix": "PA is 0.035 (0.4) / 0.03 (0.8); a PA test print tunes it per filament."},
+        {"cause": "Too hot", "check": "General ooze and a glossy surface.", "fix": "Drop 5 C."}
+      ]
+    },
+    "layer_shift": {
+      "label": "Layer shift",
+      "causes": [
+        {"cause": "Nozzle hit a curled part", "check": "Shift right after an overhang, or a scuffed top.", "fix": "Supports or re-orient (z-hop is on)."},
+        {"cause": "Something blocked the head", "check": "A cable, loose part or the ACE tube snagged.", "fix": "With the printer off, move the head through its full travel; route tubes clear."},
+        {"cause": "Belts loose", "check": "Shifts in one axis, repeatable.", "fix": "Check belt tension, then re-run the printer's input shaping calibration."},
+        {"cause": "Acceleration too high for the part", "check": "Heavy or tall prints shift at the same height.", "fix": "High-quality preset, or ask for lower acceleration."}
+      ]
+    },
+    "layer_split": {
+      "label": "Layers splitting / weak bonding",
+      "causes": [
+        {"cause": "Too cold", "check": "Layers peel apart by hand.", "fix": "Raise nozzle temp 5-10 C."},
+        {"cause": "Too much cooling (ABS/ASA/PETG)", "check": "Cracks on tall parts.", "fix": "Lower part cooling and keep the enclosure closed."},
+        {"cause": "Layer too thick for the nozzle", "check": "Layer height over about 75% of the nozzle size.", "fix": "At most 0.3 mm on the 0.4 nozzle, 0.6 mm on the 0.8."},
+        {"cause": "Under-extrusion", "check": "Thin, uneven layers.", "fix": "See 'Gaps / under-extrusion'."}
+      ]
+    },
+    "top_surface": {
+      "label": "Rough or holey top surface",
+      "causes": [
+        {"cause": "Too few top layers", "check": "Pillowing; infill shows through. The 0.8 medium profile has only 3.", "fix": "High-quality preset (6 top layers), or ask for more top layers."},
+        {"cause": "Infill too sparse under a big flat top", "check": "15% default; sagging between infill lines.", "fix": "20-25% infill, or gyroid."},
+        {"cause": "Too fast", "check": "Ripples on the last layer.", "fix": "High-quality preset (PLA fan is already 100%)."},
+        {"cause": "Over-extrusion", "check": "Ridges and a shiny, lumpy top.", "fix": "Lower the flow ratio slightly; a flow calibration print sets it per filament."}
+      ]
+    },
+    "elephant_foot": {
+      "label": "Elephant foot (bottom flares out)",
+      "causes": [
+        {"cause": "Z offset too low", "check": "First layer is see-through thin or rough.", "fix": "Raise Z offset 0.02 mm at a time."},
+        {"cause": "Bed too hot", "check": "The bottom few layers bulge, not just the first.", "fix": "Back to the normal bed temperature ('bed normal')."},
+        {"cause": "Compensation too small", "check": "Profiles use 0.075 mm (0.4) / 0.1 mm (0.8).", "fix": "Ask for 0.15-0.2 mm when parts must fit together."}
+      ]
+    },
+    "ringing": {
+      "label": "Ghosting / ringing",
+      "causes": [
+        {"cause": "Input shaping out of date", "check": "Ripples after corners; the printer was moved or belts changed.", "fix": "Re-run input shaping / resonance calibration from the touchscreen."},
+        {"cause": "Wobbly surface", "check": "The table shakes on fast moves.", "fix": "A heavy, stiff surface, ideally against a wall."},
+        {"cause": "Too fast for a display part", "check": "Visible on outer walls.", "fix": "High-quality preset (outer walls 30 mm/s)."},
+        {"cause": "Loose belts", "check": "Ringing plus shifts or a slack belt.", "fix": "Re-tension, then re-run input shaping."}
+      ]
+    },
+    "stopped": {
+      "label": "Print stopped / error mid-print",
+      "causes": [
+        {"cause": "Filament ran out or an ACE swap failed", "check": "Error on the touchscreen; spool empty or tangled.", "fix": "Reload and resume from the touchscreen if it offers it."},
+        {"cause": "ACE / tracker fault", "check": "Feed or unload error (last time it was a loose tracker plug).", "fix": "Re-seat the ACE cable and the tracker plug; check the hub."},
+        {"cause": "Heater or thermistor fault", "check": "Thermal runaway or heating-failed error.", "fix": "Check the hotend connector and wiring; don't keep retrying a heater error."},
+        {"cause": "Print Lab or the bot stopped it", "check": "The failure score was high; see /frames and the bot chat.", "fix": "Check the frames; if it was a false alarm, tell Claude so the detector can be tuned."},
+        {"cause": "Bad file", "check": "Fails at the same point every time.", "fix": "Re-slice and send it again."}
+      ]
+    }
+  }
+}
