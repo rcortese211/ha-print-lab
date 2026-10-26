@@ -96,6 +96,7 @@ HELP = (
     "archive only - add it to a link, a file's caption or your file pick to just keep the files for later\n"
     "bed 65 - hotter (or cooler) bed for the next thing you send; bed normal to undo\n"
     "first 225 - nozzle temperature for the first layer, same way; first normal to undo\n"
+    "as modeled - print the next thing the way it was modeled, no auto-orient; auto orient to undo\n"
     "Send a link to an STL/3MF/OBJ/STEP file to slice and stage it (fast / medium / high)\n"
     "Several at once: one link per line with a count, e.g. 3x <link> or <link> x5\n"
     "Printables / Thingiverse pages work; say which files: <link> 2 small and 2 large,\n"
@@ -267,6 +268,7 @@ class Bot:
         self.plates = {}           # chat -> {"jobs": [...], "total": n}: plates still to slice
         self.bed = {}              # chat -> bed temperature for the next job (all its plates)
         self.first = {}            # chat -> nozzle temperature for the first layer, same scope
+        self.as_modeled = {}       # chat -> True: next job keeps the model's own orientation
         self.load_state()
 
     def load_state(self):
@@ -274,13 +276,14 @@ class Bot:
             st = json.loads(STATE.read_text())
         except (OSError, ValueError):
             return
-        for key in ("plates", "bed", "first"):
+        for key in ("plates", "bed", "first", "as_modeled"):
             getattr(self, key).update({int(c): v for c, v in (st.get(key) or {}).items()})
 
     def save_state(self):
         try:
             tmp = STATE.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"plates": self.plates, "bed": self.bed, "first": self.first}))
+            tmp.write_text(json.dumps({"plates": self.plates, "bed": self.bed, "first": self.first,
+                                      "as_modeled": self.as_modeled}))
             tmp.replace(STATE)
         except OSError as err:
             log("couldn't save bot state:", err)
@@ -332,6 +335,10 @@ class Bot:
                 self.set_bed(chat, rest)
             elif word in ("first", "/first", "firstlayer"):
                 self.set_first(chat, rest)
+            elif re.fullmatch(r"/?as[ _]?(?:modell?ed|is)(?:\s+(?:off|normal|undo))?", text.strip().lower()):
+                self.set_as_modeled(chat, not re.search(r"(off|normal|undo)$", text.strip().lower()))
+            elif text.strip().lower() in ("auto orient", "/autoorient", "auto-orient"):
+                self.set_as_modeled(chat, False)
             elif word in ("next", "/next"):
                 self.next_plate(chat)
             elif word in QUALITY:
@@ -884,6 +891,9 @@ class Bot:
         first = self.first.get(chat)
         if first:
             body["overrides"]["first_layer_temperature"] = str(first)
+        as_modeled = self.as_modeled.get(chat)
+        if as_modeled:
+            body["orient"] = False
         if full:
             body["full_bed"] = True
         if len(items) == 1 and items[0]["count"] == 1 and not filaments:
@@ -925,6 +935,8 @@ class Bot:
             notes.append("You asked for: " + ", ".join(
                 x for x in (f"bed at {bed} °C" if bed else "", f"first layer at {first} °C" if first else "") if x)
                 + ".")
+        if as_modeled:
+            notes.append("Printed as modeled: I didn't turn anything onto a different face.")
         if full:
             notes.append("Full size, edge to edge: no brim or skirt, and it runs right up to the bed's "
                          "edges, so check the sheet is seated square.")
@@ -932,6 +944,7 @@ class Bot:
         if not left:
             self.bed.pop(chat, None)       # the job's done: next one is back to normal
             self.first.pop(chat, None)
+            self.as_modeled.pop(chat, None)
             self.save_state()
         if plate and left:
             notes.append(f"Plate {plate[0]} of {plate[1]}. When it's off the bed, send next for plate "
@@ -980,6 +993,17 @@ class Bot:
         self.save_state()
         self.tg.send(chat, f"First layer at {temp} °C on the nozzle for the next thing you send "
                      "(every plate of it). first normal to undo.")
+
+    def set_as_modeled(self, chat, on):
+        if on:
+            self.as_modeled[chat] = True
+            msg = ("As modeled for the next thing you send (every plate of it): no auto-orient, each part "
+                   "prints the way it was modeled. auto orient to undo.")
+        else:
+            self.as_modeled.pop(chat, None)
+            msg = "Back to auto-orient: I'll rest each part on its best face."
+        self.save_state()
+        self.tg.send(chat, msg)
 
     def offer_resize(self, chat, job, err):
         """The plate doesn't fit: offer to scale it, and/or put each piece on its own plate."""
