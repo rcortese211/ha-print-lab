@@ -735,11 +735,17 @@ class Bot:
     def start_slots(self, chat, items, labels, one):
         """Ask which ACE slot: once for the whole plate (one), or once per part."""
         try:
-            slots = [s for s in (self.lab.get("/printer/ace", timeout=20) or {}).get("slots", []) if s.get("loaded")]
+            ace = self.lab.get("/printer/ace", timeout=60) or {}
+            slots = [s for s in ace.get("slots", []) if s.get("loaded")]
+            if ace.get("stale"):
+                self.tg.send(chat, f"The printer isn't answering right now, so these are the ACE slots as of "
+                             f"{ace.get('at', 'last time')}.")
         except Err as err:
-            self.tg.send(chat, f"Couldn't read the ACE ({err}), so I can't say which slot to use; it'll print "
-                         "from whatever filament is already in the head.")
-            return self.ask_quality(chat, items, labels)
+            # still let the slot be picked: printing without one stalls waiting for filament
+            log("ACE read failed:", err)
+            self.tg.send(chat, "The printer isn't answering about the ACE right now, so I can't see what's "
+                         "loaded. Pick the slot yourself:")
+            slots = [{"slot": n, "loaded": True, "color": None, "material": "PLA"} for n in range(1, 5)]
         if not slots:
             self.tg.send(chat, "The ACE reports no filament loaded; it'll print from whatever filament is "
                          "already in the head.")

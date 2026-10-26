@@ -167,11 +167,22 @@ def ams_mapping(colours):
 def ace_slots():
     """What's in each ACE slot, from Rinkhals' Moonraker (mmu object)."""
     host = json.loads(PRINTER_CFG.read_text()).get("host")
-    try:
-        with urllib.request.urlopen(f"http://{host}:7125/printer/objects/query?mmu", timeout=5) as r:
-            m = json.load(r)["result"]["status"]["mmu"]
-    except Exception as err:  # noqa: BLE001
-        raise JobError(f"Couldn't read the ACE from the printer ({err})") from err
+    cache = LAB / "ace.json"
+    m, err = None, None
+    for attempt in range(3):              # Moonraker can be slow while the printer is busy
+        try:
+            with urllib.request.urlopen(f"http://{host}:7125/printer/objects/query?mmu", timeout=10) as r:
+                m = json.load(r)["result"]["status"]["mmu"]
+            break
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+            time.sleep(1)
+    if m is None:
+        print(f"[print_lab] ACE read failed: {err}", flush=True)
+        try:   # what it said last time, flagged as such (slots rarely change between prints)
+            return dict(json.loads(cache.read_text()), stale=True, error=err)
+        except (OSError, ValueError):
+            raise JobError(f"Couldn't read the ACE from the printer ({err})") from None
     status, materials, colors = m.get("gate_status") or [], m.get("gate_material") or [], m.get("gate_color") or []
     names = m.get("gate_filament_name") or []
     temps = m.get("gate_temperature") or []
@@ -183,7 +194,13 @@ def ace_slots():
                       "name": (names[i] if i < len(names) else "") or "",
                       "color": "#" + col if HEX_RE.fullmatch(col) else None,
                       "temp": (temps[i] if i < len(temps) else 0) or None})
-    return {"slots": slots, "loaded_slot": (m.get("gate") + 1) if isinstance(m.get("gate"), int) and m.get("gate") >= 0 else None}
+    out = {"slots": slots, "loaded_slot": (m.get("gate") + 1) if isinstance(m.get("gate"), int) and m.get("gate") >= 0 else None,
+           "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        cache.write_text(json.dumps(out))
+    except OSError:
+        pass
+    return out
 
 
 def read_staged():
