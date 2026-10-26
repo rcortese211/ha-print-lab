@@ -367,6 +367,15 @@ def orient(tris: np.ndarray) -> tuple[np.ndarray, dict]:
     _, r, e = best
     rotated = not np.allclose(r, np.eye(3))
     out = tris @ r.T if rotated else tris
-    e = dict(e, rotated=bool(rotated), before=original,
-             needs_supports=bool(e["overhang_mm2"] > max(40.0, 0.04 * total)))
+    e = dict(e, rotated=bool(rotated), before=original, needs_supports=_needs_supports(e, total))
     return out, e
+
+
+def _needs_supports(e: dict, total: float) -> bool:
+    return bool(e["overhang_mm2"] > max(40.0, 0.04 * total))
+
+
+def as_modeled(tris: np.ndarray) -> dict:
+    """The model left exactly as it was designed: what it touches, and whether it needs supports."""
+    e = evaluate(tris)
+    return dict(e, rotated=False, as_modeled=True, needs_supports=_needs_supports(e, e["area_mm2"] or 1.0))

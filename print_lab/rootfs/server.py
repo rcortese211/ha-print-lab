@@ -531,13 +531,14 @@ def slice_job(req):
     if full_bed and engine != "orca":
         raise JobError("Edge-to-edge plates need OrcaSlicer")
     if readable and (pieces > 1 or scale != 100 or full_bed
-                     or (want_orient and not str(inputs[0]).startswith(str(WORK)))):
+                     or not str(inputs[0]).startswith(str(WORK))):
         try:
             meshes = {}
             for p in dict.fromkeys(inputs):
                 tris = mesh.scaled(mesh.load(Path(p)), scale)
-                if want_orient and not str(p).startswith(str(WORK)):
-                    tris, info = mesh.orient(tris)
+                if not str(p).startswith(str(WORK)):
+                    # as modeled (orient: false) skips the turning, not the supports check
+                    tris, info = mesh.orient(tris) if want_orient else (tris, mesh.as_modeled(tris))
                     orientation[Path(p).name] = info
                     supports |= info["needs_supports"]
                 meshes[p] = tris
