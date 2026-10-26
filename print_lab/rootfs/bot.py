@@ -716,9 +716,10 @@ class Bot:
         return self.choose_candidates(chat, title, cands, text, archive)
 
     def ask_colours(self, chat, items, labels):
-        """Several different parts: offer one colour per part from what's loaded in the ACE."""
+        """Several different parts: one colour or one per part. Either way the slot gets picked from
+        what's loaded in the ACE: a print started without one waits for filament that never comes."""
         if len(items) < 2:
-            return self.ask_quality(chat, items, labels)
+            return self.start_slots(chat, items, labels, one=True)
         self.pending[chat] = ("colours", (items, labels), time.time())
         self.tg.buttons(chat, f"{describe(labels)}. One colour, or a colour per part?",
                         [[("One colour", "c:one"), ("Colour per part", "c:per")]])
@@ -729,40 +730,48 @@ class Bot:
             self.tg.send(chat, "Send me a link (or /print a model) first.")
             return
         items, labels = arg
-        if mode == "one":
-            return self.ask_quality(chat, items, labels)
+        self.start_slots(chat, items, labels, one=(mode == "one"))
+
+    def start_slots(self, chat, items, labels, one):
+        """Ask which ACE slot: once for the whole plate (one), or once per part."""
         try:
             slots = [s for s in (self.lab.get("/printer/ace", timeout=20) or {}).get("slots", []) if s.get("loaded")]
         except Err as err:
-            self.tg.send(chat, f"Couldn't read the ACE ({err}), so this one prints in one colour.")
+            self.tg.send(chat, f"Couldn't read the ACE ({err}), so I can't say which slot to use; it'll print "
+                         "from whatever filament is already in the head.")
             return self.ask_quality(chat, items, labels)
         if not slots:
-            self.tg.send(chat, "The ACE reports no filament loaded, so this one prints in one colour.")
+            self.tg.send(chat, "The ACE reports no filament loaded; it'll print from whatever filament is "
+                         "already in the head.")
             return self.ask_quality(chat, items, labels)
-        self.pending[chat] = ("slot", (items, labels, slots, []), time.time())
+        self.pending[chat] = ("slot", (items, labels, slots, [], one), time.time())
         self.ask_slot(chat)
 
     def ask_slot(self, chat):
-        _action, (items, labels, slots, picks), _since = self.pending[chat]
+        _action, (items, labels, slots, picks, *rest), _since = self.pending[chat]
+        rows = [[(slot_label(s), f"s:{s['slot']}")] for s in slots]
+        if rest and rest[0]:
+            what = describe(labels)
+            return self.tg.buttons(chat, f"{what}: which slot?", rows)
         i = len(picks)
         part, count = labels[i]
         self.tg.buttons(chat, f"{part}" + (f" (x{count})" if count > 1 else "")
-                        + f": which slot? ({i + 1} of {len(items)})",
-                        [[(slot_label(s), f"s:{s['slot']}")] for s in slots])
+                        + f": which slot? ({i + 1} of {len(items)})", rows)
 
     def choose_slot(self, chat, slot):
         action, arg, since = self.pending.get(chat, (None, None, 0))
         if action != "slot" or time.time() - since > CONFIRM_FOR:
             self.tg.send(chat, "Send me a link (or /print a model) first.")
             return
-        items, labels, slots, picks = arg
+        items, labels, slots, picks, *rest = arg
+        one = bool(rest and rest[0])
         by_slot = {s["slot"]: s for s in slots}
         if slot not in by_slot:
             self.tg.send(chat, f"Slot {slot} has nothing loaded.")
             return
-        picks = picks + [slot]
+        picks = [slot] * len(items) if one else picks + [slot]
         if len(picks) < len(items):
-            self.pending[chat] = ("slot", (items, labels, slots, picks), time.time())
+            self.pending[chat] = ("slot", (items, labels, slots, picks, one), time.time())
             return self.ask_slot(chat)
         order = list(dict.fromkeys(picks))          # colour 1 = the first slot picked, ...
         filaments = []
@@ -773,9 +782,12 @@ class Bot:
                 f["temp"] = int(s["temp"])
             filaments.append(f)
         items = [{**it, "filament": order.index(p) + 1} for it, p in zip(items, picks)]
-        self.tg.send(chat, "Colours:\n" + "\n".join(
-            f"  {part}" + (f" x{count}" if count > 1 else "") + f" → {slot_label(by_slot[p])}"
-            for (part, count), p in zip(labels, picks)))
+        if one:
+            self.tg.send(chat, f"All in {slot_label(by_slot[slot])}.")
+        else:
+            self.tg.send(chat, "Colours:\n" + "\n".join(
+                f"  {part}" + (f" x{count}" if count > 1 else "") + f" → {slot_label(by_slot[p])}"
+                for (part, count), p in zip(labels, picks)))
         self.ask_quality(chat, items, labels, filaments)
 
     def ask_quality(self, chat, items, labels, filaments=None):
