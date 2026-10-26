@@ -914,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
             src = GCODE / f"{m.group(1)}.gcode"
             png = WORK / f"{m.group(1)}.preview.png"
             if not png.is_file() or png.stat().st_mtime < src.stat().st_mtime:
-                segs = plate.segments(src.read_bytes())
+                segs = plate.segments(src.read_bytes(), kinds=True)
                 if segs is None:
                     return self._send(404, {"error": "nothing to draw"})
                 png.write_bytes(plate.render(segs))
